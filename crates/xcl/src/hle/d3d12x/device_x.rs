@@ -674,6 +674,12 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // The console's R9G9B9E5_SHAREDEXP becomes R11G11B10_FLOAT when the title asks for a
+    // render target or UAV: the PC device reports neither use for the shared-exponent format
+    // and rejects the resource with E_INVALIDARG. Both are 32 bpp and hold values above 1.0.
+    if format == 67 && flags & 0x5 != 0 {
+        d[0x20..0x24].copy_from_slice(&26u32.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -737,6 +743,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // a target made R11G11B10_FLOAT (`pc_resource_desc`) still gets views in 67
+        (26, 67) => 26,
         (_, v) => v,
     }
 }
@@ -746,14 +754,59 @@ pub fn stencil_view(resource: u32, view: u32) -> bool {
     matches!((resource, view), (19..=22, 22) | (44..=47, 47))
 }
 
+/// The resource's format as its console desc states it (offset 0x20).
+pub(super) fn desc_format(desc: &[u8]) -> u32 {
+    u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap())
+}
+
+/// The format an optimized clear value must use for a resource whose PC desc has
+/// `pc_resource_flags`: a depth target's typeless resource takes its DSV format, a color
+/// typeless resource (or a depth plane's SRV format) has no single clear format the PC accepts
+/// (None: pass no optimized clear value at all), everything else keeps the mapped format.
+fn pc_optimized_clear_format(
+    f: u32,
+    resource_formats: Option<(u32, u32)>,
+    pc_resource_flags: u32,
+) -> Option<u32> {
+    let mapped = match resource_formats {
+        Some((src, dst)) if f == src && src != dst => dst,
+        _ => pc_target_format(f),
+    };
+    match mapped {
+        // a depth target's typeless resource takes its DSV format as the clear format: the PC
+        // refuses a clear value in a typeless format
+        19 if pc_resource_flags & 2 != 0 => Some(20), // R32G8X24_TYPELESS → D32_FLOAT_S8X24_UINT
+        39 if pc_resource_flags & 2 != 0 => Some(40), // R32_TYPELESS → D32_FLOAT
+        44 if pc_resource_flags & 2 != 0 => Some(45), // R24G8_TYPELESS → D24_UNORM_S8_UINT
+        53 if pc_resource_flags & 2 != 0 => Some(55), // R16_TYPELESS → D16_UNORM
+        // other typeless formats (color, BC, depth without the DS use) and depth planes' SRV
+        // formats: no typed clear format is known here – pass no optimized clear value
+        1 | 5 | 9 | 15 | 19 | 21 | 22 | 23 | 27 | 33 | 39 | 44 | 46 | 47 | 48 | 53 | 60 | 70
+        | 73 | 76 | 79 | 82 | 90 | 92 | 94 | 97 => None,
+        _ => Some(mapped),
+    }
+}
+
 /// A clear value (D3D12_CLEAR_VALUE: format first) with `pc_view_format`, copied into `buf`.
-pub(super) unsafe fn pc_clear(clear: *const c_void, buf: &mut [u8; 24]) -> *const c_void {
+/// `resource_formats` is `(console format, PC format)` when `pc_resource_desc` retyped the
+/// resource, `pc_resource_flags` the retyped desc's flags: the clear value then follows the
+/// PC format (or is dropped, see `pc_optimized_clear_format`), or the PC refuses the resource
+/// ("a clear value's format must match the resource's").
+pub(super) unsafe fn pc_clear(
+    clear: *const c_void,
+    buf: &mut [u8; 24],
+    resource_formats: Option<(u32, u32)>,
+    pc_resource_flags: u32,
+) -> *const c_void {
     if clear.is_null() || !crate::gpu::shader::readable(clear as usize, 24) {
         return clear;
     }
     std::ptr::copy_nonoverlapping(clear as *const u8, buf.as_mut_ptr(), 24);
     let f = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-    buf[0..4].copy_from_slice(&pc_target_format(f).to_le_bytes());
+    let Some(mapped) = pc_optimized_clear_format(f, resource_formats, pc_resource_flags) else {
+        return std::ptr::null();
+    };
+    buf[0..4].copy_from_slice(&mapped.to_le_bytes());
     buf.as_ptr() as *const c_void
 }
 
@@ -872,7 +925,12 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         state = (state & !0x8) | 0x10;
     }
     let mut clear_buf = [0u8; 24];
-    let clear = pc_clear(clear, &mut clear_buf);
+    let clear = pc_clear(
+        clear,
+        &mut clear_buf,
+        Some((desc_format(&x), desc_format(&d))),
+        u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()),
+    );
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
@@ -926,6 +984,17 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+    }
+    if hr < 0 {
+        let mips = u16::from_le_bytes(x[0x1e..0x20].try_into().unwrap());
+        let samples = u32::from_le_bytes(x[0x24..0x28].try_into().unwrap());
+        let pc_fmt = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+        let pc_flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+        let clear_fmt = u32::from_le_bytes(clear_buf[0..4].try_into().unwrap());
+        crate::xlog_info!(
+            "D3D12.X: CreatePlacedResourceX probe: console fmt {} mips {} samples {} → PC fmt {} flags {:#x} state {state:#x} clear_fmt {clear_fmt:#x} hr {hr:#x}",
+            u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()), mips, samples, pc_fmt, pc_flags
+        );
     }
     if hr < 0 || once(&N, 4) {
         let w = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
@@ -1024,6 +1093,148 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_resource_and_view_formats() {
+        for (format, flags, expected) in [
+            (67u32, 0x0u32, 67u32),
+            (67, 0x1, 26),
+            (67, 0x4, 26),
+            (67, 0x5, 26),
+            (28, 0x5, 28),
+            (116, 0x5, 10),
+            (86, 0x5, 28),
+        ] {
+            let mut desc = [0u8; 0x38];
+            desc[0x00..0x04].copy_from_slice(&3u32.to_le_bytes()); // TEXTURE2D
+            desc[0x10..0x18].copy_from_slice(&1920u64.to_le_bytes()); // Width
+            desc[0x18..0x1c].copy_from_slice(&1080u32.to_le_bytes()); // Height
+            desc[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes()); // DepthOrArraySize
+            desc[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes()); // MipLevels
+            desc[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes()); // SampleDesc.Count
+            desc[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+
+            let pc = super::pc_resource_desc(&desc);
+            assert_eq!(
+                u32::from_le_bytes(pc[0x20..0x24].try_into().unwrap()),
+                expected,
+                "resource format={format}, flags={flags:#x}"
+            );
+        }
+
+        for (resource, view, expected) in [(26, 67, 26), (28, 86, 28), (28, 99, 99)] {
+            assert_eq!(
+                super::pc_shader_view_format(resource, view),
+                expected,
+                "resource={resource}, view={view}"
+            );
+        }
+    }
+
+    #[test]
+    fn matching_clear_follows_rewritten_resource() {
+        for (src, dst) in [(67u32, 26u32), (116u32, 10u32), (86u32, 28u32)] {
+            let mut x = [0u8; 0x38];
+            x[0x00..0x04].copy_from_slice(&3u32.to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&1920u64.to_le_bytes());
+            x[0x18..0x1c].copy_from_slice(&1080u32.to_le_bytes());
+            x[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+            x[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&src.to_le_bytes());
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
+
+            let d = pc_resource_desc(&x);
+            assert_eq!(desc_format(&d), dst, "resource format={src}, flags=0x5");
+
+            let mut input = [0u8; 24];
+            input[0..4].copy_from_slice(&src.to_le_bytes()); // the console's clear format
+            let mut output = [0xffu8; 24];
+            let ptr = unsafe { pc_clear(input.as_ptr().cast(), &mut output, Some((src, dst)), dst) };
+            assert_eq!(ptr, output.as_ptr().cast());
+            assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), dst, "clear format follows the retyped resource");
+            assert_eq!(&output[4..], &input[4..], "the clear color bytes are untouched");
+        }
+    }
+
+    #[test]
+    fn unchanged_resource_or_other_clear_format_uses_the_existing_mapping() {
+        // a resource pc_resource_desc does not retype: its clear format goes through pc_target_format as before
+        let mut x = [0u8; 0x38];
+        x[0x00..0x04].copy_from_slice(&3u32.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&1280u64.to_le_bytes());
+        x[0x18..0x1c].copy_from_slice(&720u32.to_le_bytes());
+        x[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+        x[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&67u32.to_le_bytes());
+        x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        // flags 0: plain texture, format 67 stays 67
+        x[0x30..0x34].copy_from_slice(&0u32.to_le_bytes());
+        let d = pc_resource_desc(&x);
+        assert_eq!(desc_format(&d), 67);
+
+        let mut input = [0u8; 24];
+        input[0..4].copy_from_slice(&67u32.to_le_bytes());
+        let mut output = [0u8; 24];
+        unsafe { pc_clear(input.as_ptr().cast(), &mut output, Some((67, 67)), 0) };
+        assert_eq!(u32::from_le_bytes(output[0..4].try_into().unwrap()), 67);
+
+        // a clear value in a format that is not the resource's console format is left to pc_target_format
+        let mut other = [0u8; 24];
+        other[0..4].copy_from_slice(&28u32.to_le_bytes());
+        let mut out2 = [0u8; 24];
+        unsafe { pc_clear(other.as_ptr().cast(), &mut out2, Some((67, 26)), 5) };
+        assert_eq!(u32::from_le_bytes(out2[0..4].try_into().unwrap()), 28, "pc_target_format keeps its rule for 28");
+    }
+
+    #[test]
+    fn a_depth_targets_typeless_clear_value_takes_its_dsv_format() {
+        // console depth 118 → PC 44 (R24G8_TYPELESS, ALLOW_DEPTH_STENCIL): the title's clear
+        // value arrives in the console's format (44 here) and must become the DSV format 45,
+        // else the PC refuses the whole resource (0x80070057 — format 67's crash showed the
+        // same class of refusal through a different door)
+        let mut x = [0u8; 0x38];
+        x[0x00..0x04].copy_from_slice(&3u32.to_le_bytes());
+        x[0x10..0x18].copy_from_slice(&1024u64.to_le_bytes());
+        x[0x18..0x1c].copy_from_slice(&1024u32.to_le_bytes());
+        x[0x1c..0x1e].copy_from_slice(&1u16.to_le_bytes());
+        x[0x1e..0x20].copy_from_slice(&1u16.to_le_bytes());
+        x[0x20..0x24].copy_from_slice(&118u32.to_le_bytes());
+        x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        x[0x30..0x34].copy_from_slice(&0x1800002u32.to_le_bytes());
+
+        let d = pc_resource_desc(&x);
+        assert_eq!(desc_format(&d), 44);
+        let pc_flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+        assert_eq!(pc_flags & 0xFF, 2);
+
+        for clear_src in [118u32, 44u32] {
+            let mut input = [0u8; 24];
+            input[0..4].copy_from_slice(&clear_src.to_le_bytes());
+            let mut output = [0u8; 24];
+            let ptr = unsafe {
+                pc_clear(input.as_ptr().cast(), &mut output, Some((118, 44)), pc_flags)
+            };
+            assert_eq!(ptr, output.as_ptr().cast());
+            assert_eq!(
+                u32::from_le_bytes(output[0..4].try_into().unwrap()),
+                45,
+                "clear {clear_src} → D24_UNORM_S8_UINT"
+            );
+        }
+    }
+
+    #[test]
+    fn a_color_typeless_clear_value_is_dropped_not_guessed() {
+        for (resource, pc) in [(90u32, 90u32), (92u32, 92u32), (39u32, 39u32), (53u32, 53u32)] {
+            let mut input = [0u8; 24];
+            input[0..4].copy_from_slice(&resource.to_le_bytes());
+            let mut output = [0xffu8; 24];
+            let ptr = unsafe { pc_clear(input.as_ptr().cast(), &mut output, Some((resource, pc)), 1) };
+            assert_eq!(ptr, std::ptr::null(), "clear {resource}: no format to guess, pass none");
+        }
+    }
 
     #[test]
     fn console_types_and_descs_become_pc_ones() {

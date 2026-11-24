@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use windows::core::Interface;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
@@ -219,8 +219,8 @@ struct State {
     mapped: FxHashMap<usize, TileEntry>,
     /// pool tiles also used by placed buffers (not freed while they are)
     pinned: FxHashMap<(u32, u32), u32>,
-    /// placed buffers → the pool tiles they use
-    buffers: FxHashMap<usize, Vec<(u32, u32)>>,
+    /// Final resource releases return pins to the state which issued them.
+    released_pins: ReleasedPins,
     /// reused tiles / decommitted partial pages to clear: (address, bytes)
     to_zero: Vec<(usize, usize)>,
     /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
@@ -392,6 +392,34 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+type PoolTile = (u32, u32);
+type ReleasedPins = Arc<Mutex<Vec<PoolTile>>>;
+pub(super) struct BufferPins {
+    owner: Weak<Mutex<Vec<PoolTile>>>,
+    tiles: Vec<PoolTile>,
+}
+static BUFFER_PINS: LazyLock<Mutex<FxHashMap<usize, Arc<BufferPins>>>> = LazyLock::new(Default::default);
+
+pub(super) fn buffer_pins(resource: usize) -> Option<Arc<BufferPins>> {
+    BUFFER_PINS.lock().unwrap().get(&resource).cloned()
+}
+static RELEASED_BLOCKS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Only emulator-owned blocks whose last resource or heap reference has gone enter this list.
+/// Keep the reservation until a submit or allocation can decommit it outside a driver callback.
+pub(super) fn release_owned_block(address: usize) {
+    RELEASED_BLOCKS.lock().unwrap().push(address);
+}
+
+unsafe fn reclaim_released_blocks() {
+    let blocks = std::mem::take(&mut *RELEASED_BLOCKS.lock().unwrap());
+    for address in blocks {
+        if !free(address) {
+            crate::xlog_warn!("sparse windows: could not retire owned block at {address:#x}");
+        }
+    }
+}
+
 /// (bytes of video memory in pool heaps, of those mapped) – `XCL_ACTIVITY`
 pub fn pool_bytes() -> (usize, usize) {
     let g = STATE.lock().unwrap();
@@ -542,7 +570,7 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
             retired: Vec::new(),
             mapped: FxHashMap::default(),
             pinned: FxHashMap::default(),
-            buffers: FxHashMap::default(),
+            released_pins: Default::default(),
             to_zero: Vec::new(),
             staging: None,
             ring_write: 0,
@@ -564,10 +592,9 @@ pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     match made {
         Ok(s) => {
             crate::xlog_info!("D3D12.X: {} sparse window(s) for the title's own memory (tiled buffers on video memory)", out.len());
-            // a state this replaces (the windows set up again) goes after the lock: the release of
-            // its last buffers reaches `forget_buffer`, which takes the lock (#344). What the title
+            // Release the previous state's D3D12 resources outside the mutex (#344). What the title
             // committed and protected before the device is replayed under the lock a commit or a
-            // protection now takes: neither can come between the replay and the state
+            // protection now takes: neither can come between the replay and the state.
             let mut g = STATE.lock().unwrap();
             let old = g.replace(s);
             let s = g.as_mut().unwrap();
@@ -741,6 +768,7 @@ impl State {
     /// tiles of `[a, a + n)` get video memory (mapped in their window); `initial_holes` supplies
     /// the initial 16-bit hole mask for each newly mapped 64 KiB tile.
     unsafe fn ensure_mapped(&mut self, a: usize, n: usize, mut initial_holes: impl FnMut(usize) -> u16) {
+        self.reclaim_released_pins();
         if n == 0 {
             return;
         }
@@ -1153,6 +1181,7 @@ impl State {
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
+    reclaim_released_blocks();
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -1166,6 +1195,7 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+    reclaim_released_blocks();
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc_in(window, size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -1490,9 +1520,11 @@ pub fn note_watch(t: std::time::Duration, pages: usize) {
 /// pages from the write-watch, sorted) and the reused tiles are copied asynchronously into video
 /// memory, and `queue` GPU-waits for that and for new tile mappings.
 pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page: usize) {
+    reclaim_released_blocks();
     let t0 = std::time::Instant::now();
     let mut g = STATE.lock().unwrap();
     let Some(s) = g.as_mut() else { return };
+    s.reclaim_released_pins();
     let t_locked = std::time::Instant::now();
     PHASES[0].fetch_add((t_locked - t0).as_micros() as u64, Ordering::Relaxed);
     let zero_runs = std::mem::take(&mut s.to_zero);
@@ -1608,22 +1640,36 @@ pub unsafe fn place_buffer(this: *mut c_void, va: usize, desc: &D3D12_RESOURCE_D
     for &(_, tile) in &tiles {
         *s.pinned.entry(tile).or_default() += 1;
     }
-    s.buffers.insert(raw as usize, tiles.iter().map(|x| x.1).collect());
+    BUFFER_PINS.lock().unwrap().insert(raw as usize, Arc::new(BufferPins {
+        owner: Arc::downgrade(&s.released_pins), tiles: tiles.iter().map(|x| x.1).collect()
+    }));
     s.signal();
     Some((hr, delta))
 }
 
-/// A placed buffer is gone: its tiles are not pinned by it any more.
-pub fn forget_buffer(res: usize) {
-    let mut g = STATE.lock().unwrap();
-    let Some(s) = g.as_mut() else { return };
-    let Some(tiles) = s.buffers.remove(&res) else { return };
-    for tile in tiles {
-        if let Some(c) = s.pinned.get_mut(&tile) {
-            *c -= 1;
-            if *c == 0 {
-                s.pinned.remove(&tile);
-                s.release_if_unused(tile);
+/// D3D12 can call Release under its allocator lock. Detach exact pins here so a reused
+/// interface address cannot retire a new resource, and never enter STATE from this callback.
+pub(super) fn forget_buffer(res: usize, pins: Arc<BufferPins>) {
+    let mut registrations = BUFFER_PINS.lock().unwrap();
+    if registrations.get(&res).is_some_and(|current| Arc::ptr_eq(current, &pins)) {
+        registrations.remove(&res);
+    }
+    drop(registrations);
+    if let Some(pending) = pins.owner.upgrade() {
+        pending.lock().unwrap().extend_from_slice(&pins.tiles);
+    }
+}
+
+impl State {
+    fn reclaim_released_pins(&mut self) {
+        let retired = std::mem::take(&mut *self.released_pins.lock().unwrap());
+        for tile in retired {
+            if let Some(count) = self.pinned.get_mut(&tile) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pinned.remove(&tile);
+                    self.release_if_unused(tile);
+                }
             }
         }
     }
@@ -1632,6 +1678,62 @@ pub fn forget_buffer(res: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn com_release_detaches_pins_while_the_sparse_lock_is_held() {
+        let key = usize::MAX - 11;
+        let first: ReleasedPins = Default::default();
+        let second: ReleasedPins = Default::default();
+        let state = STATE.lock().unwrap();
+        BUFFER_PINS.lock().unwrap().insert(key, Arc::new(BufferPins {
+            owner: Arc::downgrade(&first), tiles: vec![(1, 4), (1, 5)]
+        }));
+        let first_pins = buffer_pins(key).unwrap();
+        BUFFER_PINS.lock().unwrap().insert(key, Arc::new(BufferPins {
+            owner: Arc::downgrade(&second), tiles: vec![(2, 7)]
+        }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            forget_buffer(key, first_pins);
+            let _ = tx.send(());
+        });
+        let completed = rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+        drop(state);
+        handle.join().unwrap();
+        assert!(completed, "Release waited on sparse state");
+        forget_buffer(key, buffer_pins(key).expect("replacement still registered"));
+        assert!(buffer_pins(key).is_none());
+        assert_eq!(*first.lock().unwrap(), [(1, 4), (1, 5)]);
+        assert_eq!(*second.lock().unwrap(), [(2, 7)]);
+    }
+
+    #[test]
+    fn final_buffer_release_completes_with_sparse_state_locked() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut resource: Option<ID3D12Resource> = None;
+            device.unwrap().CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(TILE as u64),
+                D3D12_RESOURCE_STATE_COMMON, None, &mut resource).unwrap();
+            let resource = resource.unwrap();
+            super::super::real::adopt(resource.as_raw(), super::super::real::Kind::Resource);
+            let state = STATE.lock().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                drop(resource);
+                tx.send(()).unwrap();
+            });
+            let released = rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+            drop(state);
+            worker.join().unwrap();
+            assert!(released, "final buffer release waited for the sparse-state mutex");
+        }
+    }
 
     /// A block freed on one thread while another allocates: its address goes back to the
     /// windows only once it is decommitted (released first, the decommit came after another
@@ -1829,7 +1931,7 @@ mod tests {
                 retired: Vec::new(),
                 mapped: FxHashMap::default(),
                 pinned: FxHashMap::default(),
-                buffers: FxHashMap::default(),
+                released_pins: Default::default(),
                 to_zero: Vec::new(),
                 staging: None,
                 ring_write: 0,

@@ -984,6 +984,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
+        if buffer {
+            let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+            real::note_title_buffer_bytes(*ppv as usize, pc.Width as usize);
+        }
     }
     if hr < 0 {
         let mips = u16::from_le_bytes(x[0x1e..0x20].try_into().unwrap());

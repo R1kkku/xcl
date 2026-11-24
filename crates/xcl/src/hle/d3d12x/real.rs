@@ -3923,9 +3923,36 @@ unsafe fn standin_compute(this: *mut c_void, f: PsoFn, desc: *const c_void, riid
 }
 
 unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let Some((buf, _)) = fallback_stream(desc as *const u8) else { return E_INVALIDARG };
-    let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
-    finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
+    let mut is_mesh = false;
+    if let Some((buf, _)) = fallback_stream(desc as *const u8) {
+        is_mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+        let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
+        let hr = finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv);
+        if hr >= 0 {
+            return hr;
+        }
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 3 {
+            let types: Vec<u32> = stream_subobjects(&buf).map(|s| s.into_iter().map(|x| x.0).collect()).unwrap_or_default();
+            crate::xlog_warn!("D3D12.X: fallback_stream rejected ({hr:#x}, mesh={is_mesh}, subobjects={types:?}) – using minimal stand-in");
+        }
+    }
+    // Minimal stand-in stream using XCL's ABI root signature and dummy shaders so background
+    // pipelines are never forced onto the calling thread by console-only subobjects.
+    let Some(rs) = abi_rs_for(this, &[]) else { return E_INVALIDARG };
+    let mut out = StreamOut::default();
+    out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+    if is_mesh {
+        let Some(dm) = dummy_mesh() else { return E_INVALIDARG };
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &dm.0);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &dm.1);
+    } else {
+        let d = dummy();
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &d.vs);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &d.ps);
+    }
+    let min_desc: [usize; 2] = [out.0.len(), out.0.as_ptr() as usize];
+    finish_pso(this, f, min_desc.as_ptr() as *const c_void, riid, ppv)
 }
 
 /// Hand the title `standin`'s result now and build the real pipeline with `build` on a worker.
@@ -4391,18 +4418,66 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
             buf[at + 8..at + 16].copy_from_slice(&(b.len() as u64).to_le_bytes());
         };
         match ty {
-            1 => put(&mut buf, &d.vs),
+            1 => put(&mut buf, if mesh { &[] } else { &d.vs }),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
+            14 if at + 4 <= buf.len() => {
+                let topo = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap());
+                if !(1..=4).contains(&topo) {
+                    buf[at..at + 4].copy_from_slice(&(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32).to_le_bytes());
+                }
+            }
+            15 if at + 32 <= buf.len() => {
+                for k in 0..8 {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(buf[at + 4 * k..at + 4 * k + 4].try_into().unwrap()));
+                    buf[at + 4 * k..at + 4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                }
+            }
+            16 if at + 4 <= buf.len() => {
+                let f = super::device_x::pc_view_format(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()));
+                buf[at..at + 4].copy_from_slice(&f.to_le_bytes());
+            }
             _ => {}
         }
         off += (poff + psize + 7) & !7;
     }
     Some((buf, [size, 0]))
+}
+
+#[cfg(test)]
+mod standin_stream_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_stream_nulls_vs_on_mesh_and_sanitizes_console_formats() {
+        if dummy_mesh().is_none() {
+            eprintln!("SKIPPED fallback_stream_nulls_vs_on_mesh_and_sanitizes_console_formats: no DXC");
+            return;
+        }
+        let mut s = StreamOut::default();
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &[]);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &[1u8; 16]);
+        s.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &[2u8; 16]);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &19u32);
+        s.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &118u32);
+        let desc = [s.0.len(), s.0.as_ptr() as usize];
+        let (buf, _) = unsafe { fallback_stream(desc.as_ptr() as *const u8) }.expect("sanitized mesh stand-in");
+        let parsed = stream_subobjects(&buf).unwrap();
+        let vs_len = u64::from_le_bytes(parsed[0].1[8..16].try_into().unwrap());
+        let ms_len = u64::from_le_bytes(parsed[1].1[8..16].try_into().unwrap());
+        let topo = u32::from_le_bytes(parsed[3].1[0..4].try_into().unwrap());
+        let dsv = u32::from_le_bytes(parsed[4].1[0..4].try_into().unwrap());
+        assert_eq!(parsed[0].0, 1);
+        assert_eq!(vs_len, 0, "mesh stand-in must leave VS empty");
+        assert_eq!(parsed[1].0, 25);
+        assert!(ms_len > 0, "mesh stand-in must populate dummy MS");
+        assert_eq!(topo, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32);
+        assert_eq!(dsv, 45, "console D16S8 mapped to PC D24_UNORM_S8_UINT");
+    }
 }
 
 /// The console's pipeline topology type of rect lists (draws of topology 17, `list_x::RECT_LIST`).

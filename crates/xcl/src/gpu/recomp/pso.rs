@@ -76,22 +76,14 @@ pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
 /// Memory windows of the title's unified memory (1 without it), with `HEAP_WINDOWS` when
 /// shaders take them from the descriptor heap (`heap_windows`).
 pub fn mem_windows() -> u32 {
-    match MEM_WINDOWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => {
-            let n = crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32);
-            if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
-                n | super::HEAP_WINDOWS
-            } else {
-                n
-            }
-        }
-        n => {
-            if SWITCH_FORM.with(|s| s.get()) {
-                n & !super::HEAP_WINDOWS
-            } else {
-                n
-            }
-        }
+    let n = match MEM_WINDOWS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => crate::gpu::uma::get().map_or(1, |u| u.shader_windows() as u32),
+        n => n & !super::HEAP_WINDOWS,
+    };
+    if n > 1 && heap_windows() && !SWITCH_FORM.with(|s| s.get()) {
+        n | super::HEAP_WINDOWS
+    } else {
+        n
     }
 }
 

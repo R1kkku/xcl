@@ -393,7 +393,19 @@ fn compute_wait_timeout() -> Option<std::time::Duration> {
     })
 }
 
-/// Shared per-frame compute wait budget, reset at each `PresentX` boundary (`reset_frame_budget`).
+/// Maximum per-frame time title threads wait for uncached graphics pipelines at draw /
+/// `ExecuteIndirect` (`XCL_GRAPHICS_PSO_WAIT_MS`, default 500 ms; `0` = unbounded). A loading
+/// frame can issue dozens of uncached graphics draws in a row; sharing one budget per frame keeps
+/// the render threads from stalling the title's watchdog while workers compile them in parallel.
+fn graphics_wait_timeout() -> Option<std::time::Duration> {
+    static LIMIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let ms = std::env::var("XCL_GRAPHICS_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(500);
+        if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) }
+    })
+}
+
+/// Shared per-frame pipeline wait budget, reset at each `PresentX` boundary (`reset_frame_budget`).
 struct FrameBudget {
     spent_ms: std::sync::atomic::AtomicU64,
 }
@@ -422,17 +434,19 @@ impl FrameBudget {
 }
 
 static FRAME_BUDGET: FrameBudget = FrameBudget::new();
+static GRAPHICS_FRAME_BUDGET: FrameBudget = FrameBudget::new();
 
-/// Reset the per-frame compute pipeline wait budget (called at `PresentX`).
+/// Reset the per-frame pipeline wait budgets (called at `PresentX`).
 pub fn reset_frame_budget() {
     FRAME_BUDGET.reset();
+    GRAPHICS_FRAME_BUDGET.reset();
 }
 
-/// Bounded wait for a compute pipeline: always builds on `xcl-pso-compute-*` workers (never
-/// stalling the title's thread inside DXC/driver), waits at most the remaining per-frame `budget`
-/// up to `limit`, and returns the stand-in immediately once timed out or once the frame budget is
-/// exhausted until the worker finishes.
-fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget) -> usize {
+/// Bounded wait for a pipeline: always builds on background workers (never stalling the title's
+/// thread inside DXC/driver), waits at most the remaining per-frame `budget` up to `limit`, and
+/// returns the stand-in immediately once timed out or once the frame budget is exhausted until the
+/// worker finishes.
+fn resolve_bounded_within(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget, kind: &str) -> usize {
     let Some(limit) = limit else {
         return resolve_wait(pso);
     };
@@ -478,7 +492,7 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
             static LOGGED: AtomicUsize = AtomicUsize::new(0);
             if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
                 crate::xlog_warn!(
-                    "D3D12.X: compute pipeline {pso:#x} still building after {} ms – proceeding with stand-in (continues in background)",
+                    "D3D12.X: {kind} pipeline {pso:#x} still building after {} ms – proceeding with stand-in (continues in background)",
                     elapsed.as_millis()
                 );
             }
@@ -492,9 +506,18 @@ fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget
     }
 }
 
+fn resolve_compute_within(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget) -> usize {
+    resolve_bounded_within(pso, limit, budget, "compute")
+}
+
 /// Resolve a compute pipeline with `XCL_COMPUTE_PSO_WAIT_MS` per-frame bounding.
 pub fn resolve_compute(pso: usize) -> usize {
     resolve_compute_within(pso, compute_wait_timeout(), &FRAME_BUDGET)
+}
+
+/// Resolve a graphics pipeline with `XCL_GRAPHICS_PSO_WAIT_MS` per-frame bounding.
+pub fn resolve_graphics(pso: usize) -> usize {
+    resolve_bounded_within(pso, graphics_wait_timeout(), &GRAPHICS_FRAME_BUDGET, "graphics")
 }
 
 /// For binding: compute pipelines wait up to `XCL_COMPUTE_PSO_WAIT_MS` on background workers;
@@ -507,11 +530,11 @@ pub fn resolve_for_bind(pso: usize) -> usize {
     }
 }
 
-/// For `ExecuteIndirect`: compute pipelines use bounded waits, graphics pipelines keep `resolve_wait`.
+/// For `ExecuteIndirect`: both compute and graphics pipelines use bounded per-frame waits.
 pub fn resolve_for_indirect(pso: usize) -> usize {
     match entry(pso) {
         Some(p) if p.compute => resolve_compute(pso),
-        Some(_) => resolve_wait(pso),
+        Some(_) => resolve_graphics(pso),
         None => pso,
     }
 }
@@ -544,6 +567,11 @@ pub fn is_pending_compute(pso: usize) -> bool {
 #[cfg(test)]
 pub(crate) fn resolve_compute_with_limit_for_test(pso: usize, limit: std::time::Duration) -> usize {
     resolve_compute_within(pso, Some(limit), &FrameBudget::new())
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_graphics_with_limit_for_test(pso: usize, limit: std::time::Duration) -> usize {
+    resolve_bounded_within(pso, Some(limit), &FrameBudget::new(), "graphics")
 }
 
 /// (built in the background, failed, still building)
@@ -669,6 +697,61 @@ mod tests {
         let wait = Instant::now();
         while resolve_compute_within(standin_a, Some(Duration::from_millis(50)), &budget) != real_a {
             assert!(wait.elapsed() < Duration::from_secs(5), "background compute PSO A never completed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(released(standin_a), real_a);
+        assert_eq!(released(standin_b), real_b);
+    }
+
+    #[test]
+    fn bounded_graphics_wait_shares_budget_and_resolves_after_worker_finishes() {
+        let standin_a = 0x7300_0009usize;
+        let real_a = 0x7300_000ausize;
+        let standin_b = 0x7300_000busize;
+        let real_b = 0x7300_000cusize;
+        let budget = FrameBudget::new();
+        let (tx_a, rx_a) = mpsc::channel::<()>();
+        let (tx_b, rx_b) = mpsc::channel::<()>();
+        let (name_tx, name_rx) = mpsc::channel::<String>();
+        submit_lazy(
+            standin_a,
+            false,
+            Box::new(move || {
+                let _ = name_tx.send(std::thread::current().name().unwrap_or("").to_string());
+                let _ = rx_a.recv_timeout(Duration::from_secs(5));
+                real_a
+            }),
+            0,
+        );
+        submit_lazy(
+            standin_b,
+            false,
+            Box::new(move || {
+                let _ = rx_b.recv_timeout(Duration::from_secs(5));
+                real_b
+            }),
+            0,
+        );
+
+        // First slow graphics pipeline consumes the 60 ms frame budget on xcl-pso-* workers.
+        assert_eq!(resolve_bounded_within(standin_a, Some(Duration::from_millis(60)), &budget, "graphics"), standin_a);
+        assert!(is_pending(standin_a) && !is_pending_compute(standin_a));
+        let worker_name = name_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(worker_name.starts_with("xcl-pso-") && !worker_name.starts_with("xcl-pso-compute-"), "got {worker_name:?}");
+
+        // Second uncached graphics pipeline in the same exhausted frame returns immediately.
+        let t_b = Instant::now();
+        assert_eq!(resolve_bounded_within(standin_b, Some(Duration::from_millis(60)), &budget, "graphics"), standin_b);
+        assert!(t_b.elapsed() < Duration::from_millis(20), "second graphics pipeline must not multiply wait time");
+
+        // Once workers finish and the frame budget resets, both resolve to their real PSOs.
+        budget.reset();
+        tx_a.send(()).unwrap();
+        tx_b.send(()).unwrap();
+        assert_eq!(resolve_bounded_within(standin_b, Some(Duration::from_secs(4)), &budget, "graphics"), real_b);
+        let wait = Instant::now();
+        while resolve_bounded_within(standin_a, Some(Duration::from_millis(50)), &budget, "graphics") != real_a {
+            assert!(wait.elapsed() < Duration::from_secs(5), "background graphics PSO A never completed");
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(released(standin_a), real_a);

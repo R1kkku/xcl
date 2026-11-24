@@ -386,8 +386,18 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
 unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
-    // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    // a pipeline still being built in the background waits up to the per-frame graphics budget;
+    // if still pending, skip the draw cleanly so render threads do not trip stall watchdogs
+    let resolved = super::pso_async::resolve_graphics(pso);
+    if !super::real::is_translated_graphics(resolved) {
+        if super::pso_async::is_pending(pso) {
+            count(DRAWS_SKIPPED);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: draw with a pipeline that is still being built skipped");
+            }
+            return None;
+        }
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -395,11 +405,10 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
             let mut g = SEEN.lock().unwrap();
             if !g.contains(&pso) && g.len() < 12 {
                 g.push(pso);
-                let real = super::pso_async::resolve_wait(pso);
                 crate::xlog_info!(
-                    "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {real:#x}; pending {}, two-pass {}, RT0 {:?})",
+                    "frame trace: draw with an untranslated pipeline {pso:#x} (resolves to {resolved:#x}; pending {}, two-pass {}, RT0 {:?})",
                     super::pso_async::is_pending(pso),
-                    super::real::two_pass_of(real).is_some(),
+                    super::real::two_pass_of(resolved).is_some(),
                     super::present::rt0_resource(this as usize).map(|r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map(|x| { let d = x.GetDesc(); (d.Width, d.Height, d.Format.0) }))
                 );
             }
@@ -416,7 +425,7 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
     }
-    match bind_abi(this, &list, pso, true) {
+    match bind_abi(this, &list, resolved, true) {
         Ok(()) => {
             count(DRAWS);
             Some(list)
@@ -1203,10 +1212,53 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
+        // 4. Background graphics build is still PENDING after timeout: both graphics_bound (draws)
+        // and ExecuteIndirect must skip cleanly (DRAWS_SKIPPED) rather than drawing with a stand-in.
+        let standin_gfx = 0x7200_0007usize;
+        let real_gfx = 0x7200_0008usize;
+        let (tx_g, rx_g) = std::sync::mpsc::channel::<()>();
+        pso_async::submit_lazy(
+            standin_gfx,
+            false,
+            Box::new(move || {
+                let _ = rx_g.recv_timeout(std::time::Duration::from_secs(5));
+                real_gfx
+            }),
+            0,
+        );
+        assert_eq!(
+            pso_async::resolve_graphics_with_limit_for_test(standin_gfx, std::time::Duration::from_millis(20)),
+            standin_gfx
+        );
+        assert!(pso_async::is_pending(standin_gfx) && !pso_async::is_pending_compute(standin_gfx));
+
+        reset(list_ptr, 0x7200_0100, standin_gfx);
+        let before_gfx = counts_snapshot();
+        unsafe {
+            assert!(graphics_bound(list_ptr).is_none(), "pending graphics stand-in must skip draw");
+            execute_indirect(list_ptr, 0x7200_00F2, 1, 0, 0, 0, 0);
+        }
+        let after_gfx = counts_snapshot();
+        assert_eq!(after_gfx[DRAWS_PC], before_gfx[DRAWS_PC], "pending graphics stand-in must not draw via PC path");
+        assert!(after_gfx[DRAWS_SKIPPED] >= before_gfx[DRAWS_SKIPPED] + 2);
+        assert_eq!(
+            fake.execute_indirect_calls.load(Ordering::Relaxed),
+            1,
+            "pending graphics stand-in must be skipped, not forwarded to PC ExecuteIndirect"
+        );
+
+        tx_g.send(()).unwrap();
+        let wait_g = std::time::Instant::now();
+        while pso_async::is_pending(standin_gfx) {
+            assert!(wait_g.elapsed() < std::time::Duration::from_secs(5), "pending graphics PSO never completed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
         forget(list_ptr);
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         let _ = pso_async::released(standin_pending);
+        let _ = pso_async::released(standin_gfx);
         real::forget_pso_for_test(real_ok);
         real::forget_pso_for_test(real_pending);
     }

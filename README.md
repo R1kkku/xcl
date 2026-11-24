@@ -65,6 +65,8 @@ XCL works only on unpacked game files you already own. It does not download, dec
 
 The shader recompiler preserves branches when several loop exits share a destination or a
 branch jumps directly into an else block ([#701](https://github.com/ivall/xcl/issues/701)).
+Default depth-stencil views match the sample count of the host texture, including
+the multisampled depth buffers Minecraft Preview clears at startup.
 
 ### Media and tools
 

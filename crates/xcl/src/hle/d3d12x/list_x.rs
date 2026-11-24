@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::{transmute_copy, ManuallyDrop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
@@ -56,6 +56,9 @@ const TOP_TIMESTAMPS: u32 = 0xC;
 const MAX_FILL: u64 = 256 << 20;
 /// Bounded wait timeout for Wait32BitValueX / Wait64BitValueX so an unsatisfied wait never hangs.
 const WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a queue may GPU-wait for a writer list that has not been submitted before the CPU
+/// lets it go (the console's queue would wait for good; a PC queue must not hang the device).
+const GATE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on tracked per-list written UMA ranges (for same-list write-then-wait detection).
 const MAX_WRITTEN_RANGES: usize = 256;
 
@@ -546,6 +549,12 @@ struct ListState {
     sparse_writes: Vec<(usize, usize)>,
     /// External memory waits recorded on this list
     pending_waits: Vec<PendingWait>,
+    /// `(va, bytes, value)` of the `Write32/64BitValue…X` recorded since the list's last Reset or
+    /// submission: what it will write once it is submitted
+    value_writes: Vec<(u64, u8, u64)>,
+    /// fences queues GPU-wait on until this list is submitted (`wait_before_submit`): signalled
+    /// right after its submission, or by the CPU when it is reset or released instead
+    gates: Vec<ID3D12Fence>,
     /// bottom-of-pipe writes into memory the GPU does not see (`cpu_writes`)
     cpu_writes: Vec<super::cpu_writes::Write>,
     /// Dedicated 256-byte buffer holding the current predicate value (created lazily in COMMON state).
@@ -604,6 +613,139 @@ impl ListState {
         }
         self.pending_waits.push(w);
     }
+
+    /// `words` written at `va` once the list is submitted (for `later_writer`; the first
+    /// `MAX_WRITTEN_RANGES` of a recording). A GPU wait already queued for such a value and
+    /// without a writer (`WATCHED`) now waits for this list.
+    fn note_value_write(&mut self, va: u64, words: &[u32]) {
+        let (bytes, value) = (4 * words.len() as u8, value_of(words));
+        if self.value_writes.len() < MAX_WRITTEN_RANGES {
+            self.value_writes.push((va, bytes, value));
+        }
+        if WATCHING.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut watched = WATCHED.lock().unwrap();
+        for e in watched.iter_mut().filter(|e| !e.claimed && meets(va, bytes, value, &e.wait)) {
+            e.claimed = true;
+            self.add_gate(e.fence.clone());
+        }
+    }
+
+    fn add_gate(&mut self, fence: ID3D12Fence) {
+        if self.gates.is_empty() {
+            GATED_LISTS.fetch_add(1, Ordering::AcqRel);
+        }
+        self.gates.push(fence);
+    }
+
+    /// The list's gates (the caller signals them).
+    fn take_gates(&mut self) -> Vec<ID3D12Fence> {
+        if !self.gates.is_empty() {
+            GATED_LISTS.fetch_sub(1, Ordering::AcqRel);
+        }
+        std::mem::take(&mut self.gates)
+    }
+
+    /// Whether this list, once submitted, writes a value at `w.va` that meets `w`.
+    fn writes_to_meet(&self, w: &PendingWait) -> bool {
+        self.value_writes.iter().any(|&(va, bytes, value)| meets(va, bytes, value, w))
+    }
+}
+
+/// Whether writing `value` (`bytes` wide) at `va` meets `w`.
+fn meets(va: u64, bytes: u8, value: u64, w: &PendingWait) -> bool {
+    let v = if va == w.va && bytes == w.width {
+        value
+    } else if bytes == 8 && w.width == 4 && (w.va == va || w.va == va + 4) {
+        // a 32-bit wait on one half of a 64-bit write
+        (value >> (8 * (w.va - va))) & 0xFFFF_FFFF
+    } else {
+        return false;
+    };
+    compare_u64(w.comparison, v & w.mask, w.value) == Some(true)
+}
+
+/// A list other than `waiter`, recorded and not yet submitted, whose writes meet `w`: on the
+/// console the waiting queue holds on the GPU until that list has run.
+fn later_writer(m: &HashMap<usize, ListState>, waiter: usize, w: &PendingWait) -> Option<usize> {
+    m.iter().find(|&(&l, s)| l != waiter && s.writes_to_meet(w)).map(|(&l, _)| l)
+}
+
+/// Let go gates whose list will not be submitted (reset or released): their waiting queues go on.
+fn open_gates(gates: Vec<ID3D12Fence>) {
+    for f in gates {
+        unsafe {
+            let _ = f.Signal(1);
+        }
+    }
+}
+
+/// A queue's GPU wait for a memory value (`wait_before_submit`), until its fence is signalled:
+/// by the writer list's queue after it (`claimed`: a list recorded that write), or by the
+/// watcher when the memory meets the wait (a CPU write) or after `GATE_TIMEOUT`.
+struct Watched {
+    wait: PendingWait,
+    fence: ID3D12Fence,
+    since: Instant,
+    claimed: bool,
+}
+
+// D3D12 fences are free-threaded
+unsafe impl Send for Watched {}
+
+static WATCHED: Mutex<Vec<Watched>> = Mutex::new(Vec::new());
+/// entries of `WATCHED` (fast-path guard for recording a write)
+static WATCHING: AtomicUsize = AtomicUsize::new(0);
+static WATCH_CV: Condvar = Condvar::new();
+
+/// Queue `fence` (that a queue now GPU-waits on for `wait`) for the watcher.
+fn watch(wait: PendingWait, fence: ID3D12Fence, claimed: bool) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new().name("xcl-gpu-waits".into()).spawn(watcher);
+    });
+    let mut g = WATCHED.lock().unwrap();
+    g.push(Watched { wait, fence, since: Instant::now(), claimed });
+    WATCHING.store(g.len(), Ordering::Release);
+    WATCH_CV.notify_one();
+}
+
+/// Signals each watched fence once its memory meets the wait or it is `GATE_TIMEOUT` old, and
+/// forgets the ones signalled.
+fn watcher() {
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let mut g = WATCHED.lock().unwrap();
+        while g.is_empty() {
+            g = WATCH_CV.wait(g).unwrap();
+        }
+        g.retain(|e| unsafe {
+            if e.fence.GetCompletedValue() >= 1 {
+                return false;
+            }
+            let late = e.since.elapsed() >= GATE_TIMEOUT;
+            if !e.wait.is_satisfied() && !late {
+                return true;
+            }
+            if late && once(&LATE, 8) {
+                crate::xlog_warn!(
+                    "D3D12.X: Wait{}BitValueX at {:#x} (op {}, want {:#x}) held its queue on the GPU for {} s without its value ({}): the queue goes on",
+                    e.wait.width * 8,
+                    e.wait.va,
+                    e.wait.comparison,
+                    e.wait.value,
+                    GATE_TIMEOUT.as_secs(),
+                    if e.claimed { "the list writing it was not submitted" } else { "no list recorded it" }
+                );
+            }
+            let _ = e.fence.Signal(1);
+            false
+        });
+        WATCHING.store(g.len(), Ordering::Release);
+        drop(g);
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -617,6 +759,8 @@ static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 static LIVE_QUEUES: Mutex<Vec<QueueInfo>> = Mutex::new(Vec::new());
 /// Number of lists with at least one pending `Wait32/64BitValueX` (fast-path guard for ExecuteCommandLists).
 static PENDING_WAIT_LISTS: AtomicUsize = AtomicUsize::new(0);
+/// Number of lists holding a `gate` (fast-path guard for signalling after a submission).
+static GATED_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Number of lists with recorded sparse-window memory writes (fast-path guard for post-execute readback).
 static SPARSE_WRITE_LISTS: AtomicUsize = AtomicUsize::new(0);
 /// Set once any list uses `RSSetDepthBiasX` (fast-path guard for Draw* hooks).
@@ -686,14 +830,15 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
     let old = {
         let mut g = LISTS.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
-        let old = m.remove(&key);
-        if let Some(ref old) = old {
+        let mut old = m.remove(&key);
+        if let Some(ref mut old) = old {
             if !old.pending_waits.is_empty() {
                 PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
             if !old.sparse_writes.is_empty() {
                 SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
             }
+            open_gates(old.take_gates());
         }
         m.insert(key, ListState { allocator: alloc, list_type: Some(ty), bound_pso: pso, ..Default::default() });
         old
@@ -717,13 +862,14 @@ pub unsafe fn on_create(list: *mut c_void, alloc: usize, pso: usize, ty: D3D12_C
 pub(super) fn on_release(list: usize) {
     super::title_textures::list_reset(list);
     let old = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&list));
-    if let Some(old) = old {
+    if let Some(mut old) = old {
         if !old.pending_waits.is_empty() {
             PENDING_WAIT_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
         if !old.sparse_writes.is_empty() {
             SPARSE_WRITE_LISTS.fetch_sub(1, Ordering::AcqRel);
         }
+        open_gates(old.take_gates());
     }
 }
 
@@ -856,7 +1002,10 @@ pub(super) unsafe fn note_queue_for_lists(queue: usize, lists: &[*mut c_void]) {
     let m = g.get_or_insert_with(HashMap::new);
     for &l in lists {
         if !l.is_null() {
-            m.entry(l as usize).or_default().last_queue = Some(queue);
+            let s = m.entry(l as usize).or_default();
+            s.last_queue = Some(queue);
+            // being submitted: no later wait is held for these writes any more
+            s.value_writes.clear();
         }
     }
 }
@@ -873,6 +1022,16 @@ fn pick_queue(last_queue: Option<usize>, device: usize, ty: D3D12_COMMAND_LIST_T
 
 fn note_write(list: usize, va: u64, size: u64) {
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_write(va, size);
+}
+
+/// the value of one or two little-endian 32-bit words
+fn value_of(words: &[u32]) -> u64 {
+    words.iter().rev().fold(0u64, |v, &w| (v << 32) | w as u64)
+}
+
+/// `list` will write `words` at `va` once submitted (for `later_writer`).
+fn note_value_write(list: usize, va: u64, words: &[u32]) {
+    LISTS.lock().unwrap().get_or_insert_with(HashMap::new).entry(list).or_default().note_value_write(va, words);
 }
 
 unsafe fn wait_all(waits: &[PendingWait]) {
@@ -928,9 +1087,99 @@ pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void])
     super::cpu_writes::after(queue, writes);
 }
 
-/// Submit `lists` through `submit`, splitting the batch before any list whose `Wait32/64BitValueX`
-/// condition is not yet satisfied so earlier lists in the same batch can run on the GPU first.
-pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+/// Before `list` goes to `queue`: each wait of `waits` not met yet becomes a GPU wait of `queue`
+/// on a fence of its own, as on the console. A list recorded but not submitted yet that writes
+/// the value (`later_writer`), or the first one recorded later (`note_value_write`), signals the
+/// fence on its queue right after its submission; the watcher signals it if the memory meets
+/// the wait first (a CPU write) or after `GATE_TIMEOUT`. With no queue, or when a fence cannot
+/// be made, the wait is done on the CPU, as before. (A retail game submits a list waiting for a
+/// counter before the list on another queue that writes it, from one thread – at times before
+/// that list is even recorded: waiting on the CPU held the thread 2 s per wait, and the writer
+/// came after.)
+unsafe fn wait_before_submit(queue: *mut c_void, list: usize, waits: &[PendingWait]) {
+    static GATED: AtomicU64 = AtomicU64::new(0);
+    let q = if queue.is_null() { None } else { ID3D12CommandQueue::from_raw_borrowed(&queue) };
+    let mut on_cpu = Vec::new();
+    for w in waits {
+        if w.is_satisfied() {
+            continue;
+        }
+        let fence = q.and_then(|q| {
+            let mut dev: Option<ID3D12Device> = None;
+            q.GetDevice(&mut dev).ok()?;
+            dev?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).ok()
+        });
+        let (Some(q), Some(fence)) = (q, fence) else {
+            on_cpu.push(*w);
+            continue;
+        };
+        if let Err(e) = q.Wait(&fence, 1) {
+            crate::xlog_warn!("D3D12.X: a GPU wait for a memory value could not be queued ({e}): waiting on the CPU");
+            on_cpu.push(*w);
+            continue;
+        }
+        let writer = {
+            let mut g = LISTS.lock().unwrap();
+            let m = g.get_or_insert_with(HashMap::new);
+            let writer = later_writer(m, list, w);
+            if let Some(s) = writer.and_then(|l| m.get_mut(&l)) {
+                s.add_gate(fence.clone());
+            }
+            writer
+        };
+        if once(&GATED, 8) {
+            crate::xlog_info!(
+                "D3D12.X: Wait{}BitValueX at {:#x} (op {}, want {:#x}) waits on the GPU for {}",
+                w.width * 8,
+                w.va,
+                w.comparison,
+                w.value,
+                match writer {
+                    Some(l) => format!("list {l:#x}, which writes it and is not submitted yet"),
+                    None => "a list that writes it, not recorded yet".to_string(),
+                }
+            );
+        }
+        watch(*w, fence, writer.is_some());
+    }
+    if !on_cpu.is_empty() {
+        wait_all(&on_cpu);
+    }
+}
+
+/// After `lists` went to `queue`: their gates are signalled on `queue`, after them.
+unsafe fn after_submit(queue: *mut c_void, lists: &[*mut c_void]) {
+    if GATED_LISTS.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let gates: Vec<ID3D12Fence> = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(m) = g.as_mut() else { return };
+        let mut gates = Vec::new();
+        for &l in lists {
+            if let Some(s) = m.get_mut(&(l as usize)) {
+                gates.extend(s.take_gates());
+            }
+        }
+        gates
+    };
+    let q = if queue.is_null() { None } else { ID3D12CommandQueue::from_raw_borrowed(&queue) };
+    for f in gates {
+        match q {
+            Some(q) if q.Signal(&f, 1).is_ok() => {}
+            _ => open_gates(vec![f]),
+        }
+    }
+}
+
+/// Submit `lists` to `queue` through `submit`, splitting the batch before any list whose
+/// `Wait32/64BitValueX` condition is not yet satisfied so earlier lists in the same batch can run
+/// on the GPU first (`wait_before_submit`).
+pub(super) unsafe fn execute_with_waits(queue: *mut c_void, lists: &[*mut c_void], mut submit: impl FnMut(&[*mut c_void])) {
+    let mut submit = |chunk: &[*mut c_void]| {
+        submit(chunk);
+        after_submit(queue, chunk);
+    };
     if lists.is_empty() || PENDING_WAIT_LISTS.load(Ordering::Acquire) == 0 {
         submit(lists);
         return;
@@ -955,7 +1204,7 @@ pub(super) unsafe fn execute_with_waits(lists: &[*mut c_void], mut submit: impl 
         if i > start {
             submit(&lists[start..i]);
         }
-        wait_all(waits);
+        wait_before_submit(queue, lists[i] as usize, waits);
         start = i;
     }
     if start < lists.len() {
@@ -1099,12 +1348,14 @@ unsafe fn write(list: *mut c_void, va: u64, words: &[u32], mode: D3D12_WRITEBUFF
         if super::cpu_writes::writable(va as usize, n as usize) {
             if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
                 s.cpu_writes.push(super::cpu_writes::Write::Immediate(va as usize, words.to_vec()));
+                s.note_value_write(va, words);
                 return;
             }
         }
         return warn(&N, what, format_args!("{va:#x} is not in unified memory"));
     };
     note_write(list as usize, va, n);
+    note_value_write(list as usize, va, words);
     let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words.iter().enumerate().map(|(i, &w)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * i as u64, Value: w }).collect();
     let modes = vec![mode; words.len()];
     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, *const D3D12_WRITEBUFFERIMMEDIATE_MODE);
@@ -1533,6 +1784,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         };
         let sparse_writes = s.clear_sparse_writes();
         s.written_ranges.clear();
+        // being submitted below
+        s.value_writes.clear();
         let cpu_writes = std::mem::take(&mut s.cpu_writes);
         let pred_in_state = std::mem::replace(&mut s.pred_in_state, false);
         let pred_buf = s.pred_buf.as_ref().map(|r| r.as_raw() as usize);
@@ -1560,13 +1813,14 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     let q_raw = queue as *mut c_void;
     super::title_textures::refresh(q_raw);
     if !waits.is_empty() {
-        wait_all(&waits);
+        wait_before_submit(q_raw, this as usize, &waits);
     }
 
     type ExecFn = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let exec: ExecFn = transmute_copy(&real::orig_fn(q_raw, PC_QUEUE_EXECUTE_COMMAND_LISTS));
     let one = [this];
     exec(q_raw, 1, one.as_ptr());
+    after_submit(q_raw, &one);
     // what ran is in the textures' states; the list records anew after its Reset below
     super::title_textures::submitted(&one);
     super::title_textures::list_reset(this as usize);
@@ -2121,9 +2375,12 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
 
-    let is_bundle = {
+    let (is_bundle, gate) = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
+        // re-recorded without being submitted: what it was going to write will not come
+        s.value_writes.clear();
+        let gate = s.take_gates();
         s.allocator = alloc;
         s.bound_pso = pso;
         s.depth_bias = None;
@@ -2140,8 +2397,9 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.predication = None;
         s.pred_in_state = false;
         s.bindings = Bindings::default();
-        s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+        (s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE), gate)
     };
+    open_gates(gate);
     super::title_textures::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
@@ -2780,7 +3038,7 @@ mod tests {
 
         let mut batches: Vec<Vec<usize>> = Vec::new();
         unsafe {
-            execute_with_waits(&[l0, l1, l2], |chunk| {
+            execute_with_waits(std::ptr::null_mut(), &[l0, l1, l2], |chunk| {
                 batches.push(chunk.iter().map(|&p| p as usize).collect());
                 // Simulate l0's GPU execution satisfying l1's wait!
                 if chunk.contains(&l0) {
@@ -2793,7 +3051,7 @@ mod tests {
         // Now that cell == 42 is already satisfied, the whole batch submits in one call.
         batches.clear();
         unsafe {
-            execute_with_waits(&[l0, l1, l2], |chunk| {
+            execute_with_waits(std::ptr::null_mut(), &[l0, l1, l2], |chunk| {
                 batches.push(chunk.iter().map(|&p| p as usize).collect());
             });
         }
@@ -2802,6 +3060,115 @@ mod tests {
         on_release(l0 as usize);
         on_release(l1 as usize);
         on_release(l2 as usize);
+    }
+
+    #[test]
+    fn a_later_writer_is_a_list_not_submitted_whose_value_meets_the_wait() {
+        let w64 = |va, op: D3D12_COMPARISON_FUNC, value| PendingWait { va, width: 8, comparison: op.0 as u32, value, mask: u64::MAX };
+        let mut m: HashMap<usize, ListState> = HashMap::new();
+        m.entry(1).or_default().value_writes.push((0x1000, 8, 0x1443));
+        m.entry(2).or_default().value_writes.push((0x2000, 8, 0x1_0000_0007));
+        m.entry(3).or_default();
+
+        assert_eq!(later_writer(&m, 3, &w64(0x1000, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 0x1443)), Some(1));
+        // a value that does not meet it, another address, or the waiting list itself: none
+        assert_eq!(later_writer(&m, 3, &w64(0x1000, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 0x1444)), None);
+        assert_eq!(later_writer(&m, 3, &w64(0x1008, D3D12_COMPARISON_FUNC_GREATER_EQUAL, 1)), None);
+        assert_eq!(later_writer(&m, 1, &w64(0x1000, D3D12_COMPARISON_FUNC_EQUAL, 0x1443)), None);
+        // a 32-bit wait on either half of a 64-bit write
+        let w32 = |va, value| PendingWait { va, width: 4, comparison: D3D12_COMPARISON_FUNC_EQUAL.0 as u32, value, mask: u32::MAX as u64 };
+        assert_eq!(later_writer(&m, 3, &w32(0x2000, 7)), Some(2));
+        assert_eq!(later_writer(&m, 3, &w32(0x2004, 1)), Some(2));
+        assert_eq!(later_writer(&m, 3, &w32(0x2004, 7)), None);
+        assert_eq!(value_of(&[0x1443, 0x2]), 0x2_0000_1443);
+    }
+
+    /// A list waiting for a counter that a list on another queue writes, submitted before that
+    /// list (a retail game does this from one thread): the submit returns at once, its queue holds
+    /// on the GPU until the writer is submitted – also one recorded only after the submit – and a
+    /// writer released instead, or the CPU writing the counter, lets it go.
+    #[test]
+    fn a_wait_for_a_later_list_holds_the_gpu_not_the_submitting_thread() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                crate::gpu::recomp::runner::skip_test("no GPU");
+                return;
+            }
+            let dev = dev.unwrap();
+            let queue = || -> ID3D12CommandQueue { dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap() };
+            let (qa, qb) = (queue(), queue());
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list = || -> ID3D12GraphicsCommandList {
+                let l: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                l.Close().unwrap();
+                l
+            };
+            let run = |q: &ID3D12CommandQueue, l: &ID3D12GraphicsCommandList| {
+                let l = l.as_raw();
+                execute_with_waits(q.as_raw(), &[l], |chunk| q.ExecuteCommandLists(&[ID3D12CommandList::from_raw_borrowed(&chunk[0]).cloned()]));
+            };
+            let counter = Box::new(AtomicU64::new(0));
+            let va = &*counter as *const AtomicU64 as u64;
+            let done: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let reached = |v: u64| {
+                let t = Instant::now();
+                while done.GetCompletedValue() < v && t.elapsed() < Duration::from_secs(5) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                done.GetCompletedValue() >= v
+            };
+
+            #[derive(PartialEq)]
+            enum Writer {
+                RecordedThenSubmitted,
+                RecordedThenReleased,
+                RecordedAfterTheWait,
+                Cpu,
+            }
+            for (round, how) in [(1u64, Writer::RecordedThenSubmitted), (2, Writer::RecordedThenReleased), (3, Writer::RecordedAfterTheWait), (4, Writer::Cpu)] {
+                let (waiter, writer) = (list(), list());
+                on_create(waiter.as_raw(), alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+                on_create(writer.as_raw(), alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
+                {
+                    let mut g = LISTS.lock().unwrap();
+                    let m = g.as_mut().unwrap();
+                    m.get_mut(&(waiter.as_raw() as usize)).unwrap().push_wait(PendingWait { va, width: 8, comparison: D3D12_COMPARISON_FUNC_GREATER_EQUAL.0 as u32, value: round, mask: u64::MAX });
+                    if how == Writer::RecordedThenSubmitted || how == Writer::RecordedThenReleased {
+                        m.get_mut(&(writer.as_raw() as usize)).unwrap().note_value_write(va, &[round as u32, 0]);
+                    }
+                }
+
+                let t = Instant::now();
+                run(&qa, &waiter);
+                assert!(t.elapsed() < WAIT_TIMEOUT / 2, "round {round}: the submit waited {:?} on the CPU", t.elapsed());
+                qa.Signal(&done, round).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+                assert!(done.GetCompletedValue() < round, "round {round}: the waiting queue ran before its writer was submitted");
+
+                match how {
+                    Writer::RecordedThenSubmitted => run(&qb, &writer),
+                    Writer::RecordedThenReleased => on_release(writer.as_raw() as usize),
+                    Writer::RecordedAfterTheWait => {
+                        note_value_write(writer.as_raw() as usize, va, &[round as u32, 0]);
+                        std::thread::sleep(Duration::from_millis(200));
+                        assert!(done.GetCompletedValue() < round, "round {round}: the waiting queue ran before its writer was submitted");
+                        run(&qb, &writer);
+                    }
+                    Writer::Cpu => counter.store(round, Ordering::Release),
+                }
+                assert!(reached(round), "round {round}: the waiting queue never went on");
+                on_release(waiter.as_raw() as usize);
+                on_release(writer.as_raw() as usize);
+            }
+            assert_eq!(GATED_LISTS.load(Ordering::Acquire), 0);
+            let t = Instant::now();
+            while WATCHING.load(Ordering::Acquire) != 0 && t.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(WATCHING.load(Ordering::Acquire), 0, "every GPU wait was let go");
+        }
     }
 
     #[test]

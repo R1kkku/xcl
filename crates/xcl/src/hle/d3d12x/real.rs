@@ -1486,28 +1486,26 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
         UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
         return S_OK;
     }
+    // a texture kept in step with title memory, or a resource placed at a title address
+    // (reserved or DEFAULT-heap on the PC): answer with its title address before calling PC Map
+    // so reserved / DEFAULT-heap resources do not trigger D3D12 debug layer errors (#940 id 824)
+    if let Some(p) = super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
+        if !data.is_null() {
+            *data = p as *mut c_void;
+        }
+        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        return S_OK;
+    }
     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
     let hr = f(this, sub, range, data);
-    if hr >= 0 {
-        return hr;
-    }
-    match super::title_textures::address(this as usize).or_else(|| TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied())) {
-        Some(p) => {
-            if !data.is_null() {
-                *data = p as *mut c_void;
-            }
-            UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
-            S_OK
-        }
-        None => {
-            static N: AtomicU64 = AtomicU64::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 8 {
-                let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
-                crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
-            }
-            hr
+    if hr < 0 {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            let d = ID3D12Resource::from_raw_borrowed(&this).map(|r| r.GetDesc());
+            crate::xlog_warn!("D3D12.X: Map of a resource not in unified memory → {:#x} ({:?})", hr as u32, d.map(|d| (d.Dimension.0, d.Width, d.Height, d.Format.0, d.Flags.0)));
         }
     }
+    hr
 }
 
 /// WriteToSubresource(subresource, box, data, row pitch, depth pitch): the CPU writing texels.
@@ -5827,6 +5825,110 @@ mod this_first_tests {
         if let Some(g) = EXTS.lock().unwrap().as_mut() {
             g.remove(&vtbl);
         }
+    }
+}
+
+#[cfg(test)]
+mod res_map_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static PC_MAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PC_UNMAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PC_MAP_RESULT: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "system" fn fake_pc_map(_this: *mut c_void, _sub: u32, _range: *const c_void, data: *mut *mut c_void) -> HRESULT {
+        PC_MAP_CALLS.fetch_add(1, Ordering::SeqCst);
+        let p = PC_MAP_RESULT.load(Ordering::SeqCst);
+        if p == 0 {
+            E_INVALIDARG
+        } else {
+            if !data.is_null() {
+                *data = p as *mut c_void;
+            }
+            S_OK
+        }
+    }
+
+    unsafe extern "system" fn fake_pc_unmap(_this: *mut c_void, _sub: u32, _range: *const c_void) {
+        PC_UNMAP_CALLS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    struct Cleanup {
+        vtbl: usize,
+        objs: [usize; 2],
+    }
+
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            CLASSES.lock().unwrap().retain(|c| c.ext != self.vtbl);
+            if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+                for o in self.objs {
+                    m.remove(&o);
+                }
+            }
+            if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+                for o in self.objs {
+                    s.remove(&o);
+                }
+            }
+        }
+    }
+
+    /// A resource placed at a title address (e.g. reserved or DEFAULT-heap texture) gives its
+    /// title address without calling PC `ID3D12Resource::Map` (which fails and raises D3D12
+    /// debug layer error 824 / MAP_INVALIDHEAP); plain PC resources still forward to PC Map/Unmap.
+    #[test]
+    fn title_address_resource_returns_address_without_calling_pc_map() {
+        let iface = layout::find("ID3D12Resource").expect("ID3D12Resource layout");
+        let map_slot = layout::slot(iface, "Map").expect("Map slot");
+        let unmap_slot = layout::slot(iface, "Unmap").expect("Unmap slot");
+        let mut pc = [0usize; 32];
+        pc[map_slot] = fake_pc_map as usize;
+        pc[unmap_slot] = fake_pc_unmap as usize;
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+
+        let obj_title = [vtbl];
+        let obj_pc = [vtbl];
+        let title_ptr = obj_title.as_ptr() as *mut c_void;
+        let pc_ptr = obj_pc.as_ptr() as *mut c_void;
+        let _cleanup = Cleanup { vtbl, objs: [title_ptr as usize, pc_ptr as usize] };
+
+        CLASSES.lock().unwrap().push(Class {
+            orig: pc.as_ptr() as usize,
+            kind: Kind::Resource,
+            ext: vtbl,
+            iface,
+            public: 17,
+            scanned: 17,
+        });
+
+        let fake_va = 0x7000_0000usize;
+        note_title_address(title_ptr as usize, fake_va);
+
+        PC_MAP_CALLS.store(0, Ordering::SeqCst);
+        PC_UNMAP_CALLS.store(0, Ordering::SeqCst);
+        PC_MAP_RESULT.store(0, Ordering::SeqCst);
+
+        let mut mapped: *mut c_void = std::ptr::null_mut();
+        let hr = unsafe { res_map(title_ptr, 0, std::ptr::null(), &mut mapped) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(mapped as usize, fake_va);
+        assert_eq!(PC_MAP_CALLS.load(Ordering::SeqCst), 0, "PC Map must not be called for a title-address resource");
+        unsafe { res_unmap(title_ptr, 0, std::ptr::null()) };
+        assert_eq!(PC_UNMAP_CALLS.load(Ordering::SeqCst), 0, "PC Unmap must not be called for an unmappable resource");
+
+        // Control: a plain PC resource (no title address) still forwards to PC Map and Unmap.
+        let pc_va = 0x5555_0000usize;
+        PC_MAP_RESULT.store(pc_va, Ordering::SeqCst);
+        mapped = std::ptr::null_mut();
+        let hr = unsafe { res_map(pc_ptr, 0, std::ptr::null(), &mut mapped) };
+        assert_eq!(hr, S_OK);
+        assert_eq!(mapped as usize, pc_va);
+        assert_eq!(PC_MAP_CALLS.load(Ordering::SeqCst), 1);
+        unsafe { res_unmap(pc_ptr, 0, std::ptr::null()) };
+        assert_eq!(PC_UNMAP_CALLS.load(Ordering::SeqCst), 1);
     }
 }
 

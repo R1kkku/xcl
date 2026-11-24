@@ -2508,7 +2508,7 @@ pub(super) unsafe extern "system" fn dispatch_x(this: *mut c_void, x: u32, y: u3
 /// command list #146 console compute/UAV barrier (used by `XboxBvhBuilder.dll` between BVH
 /// build passes): emits a global UAV barrier so UMA writes become visible to the next pass
 pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, groups: *const c_void) {
-    note_depth_uav_barrier_groups(n, groups);
+    let syncs = note_depth_uav_barrier_groups(n, groups);
     let b = D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -2517,6 +2517,12 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, n: u32, gr
         },
     };
     pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    // depth buffers that shaders write: their twins follow the title's layout changes (#970)
+    for (res, into) in syncs {
+        let barrier = |b: &[D3D12_RESOURCE_BARRIER]| pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, b.len() as u32, b.as_ptr());
+        let copy = |dst: &ID3D12Resource, src: &ID3D12Resource| pc::<unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void)>(this, PC_COPY_RESOURCE)(this, dst.as_raw(), src.as_raw());
+        super::depth_twin::sync(res, into, &barrier, &copy);
+    }
 }
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
@@ -3540,12 +3546,12 @@ pub(super) enum UavUse {
 }
 
 /// A barrier of the title that uses such a depth buffer as a UAV. Counted; the first 8 and
-/// every power of two are logged.
-pub(super) unsafe fn note_depth_uav_barrier(res: usize, how: UavUse) {
+/// every power of two are logged. Returns whether `res` is such a depth buffer.
+pub(super) unsafe fn note_depth_uav_barrier(res: usize, how: UavUse) -> bool {
     let r = res as *mut c_void;
-    let Some(d) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return };
+    let Some(d) = ID3D12Resource::from_raw_borrowed(&r).map(|x| x.GetDesc()) else { return false };
     if !depth_without_uav(d.Flags.0) {
-        return;
+        return false;
     }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3555,11 +3561,11 @@ pub(super) unsafe fn note_depth_uav_barrier(res: usize, how: UavUse) {
             UavUse::UavBarrier => "a UAV barrier".into(),
             UavUse::Layout(before, after) => format!("a texture barrier, layout {before} → {after},"),
         };
-        crate::xlog_warn!(
-            "D3D12.X: {what} uses a depth buffer as a UAV ({}x{}x{}, format {}); its UAVs are null views, what shaders write there is lost ({n} so far)",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        );
+        let r = ID3D12Resource::from_raw_borrowed(&r).unwrap();
+        let views = if super::depth_twin::twin_of(r).is_some() { "views of its twin (#970)" } else { "null views, what shaders write there is lost" };
+        crate::xlog_warn!("D3D12.X: {what} uses a depth buffer as a UAV ({}x{}x{}, format {}); its UAVs are {views} ({n} so far)", d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
     }
+    true
 }
 
 /// Whether an enhanced texture barrier moves its texture into or out of unordered access
@@ -3572,10 +3578,13 @@ fn barrier_uses_uav(layouts: (i32, i32), access: (i32, i32)) -> bool {
 /// #146 Barrier(n, groups): the title's enhanced barriers (D3D12_BARRIER_GROUP) – XCL turns them
 /// into one global UAV barrier and their description is not read (`uav_barrier_x`). Its texture
 /// barriers that use a depth buffer without UAVs as one are counted (`note_depth_uav_barrier`).
-pub(super) unsafe fn note_depth_uav_barrier_groups(n: u32, groups: *const c_void) {
+/// Returns those that move such a depth buffer into (true) or out of (false) the
+/// UNORDERED_ACCESS layout, for its twin (`depth_twin::sync`; empty when twins are off).
+pub(super) unsafe fn note_depth_uav_barrier_groups(n: u32, groups: *const c_void) -> Vec<(usize, bool)> {
+    let mut syncs = Vec::new();
     let group_bytes = std::mem::size_of::<D3D12_BARRIER_GROUP>();
     if n == 0 || n > 1024 || groups.is_null() || !crate::gpu::shader::readable(groups as usize, n as usize * group_bytes) {
-        return;
+        return syncs;
     }
     let groups = std::slice::from_raw_parts(groups as *const D3D12_BARRIER_GROUP, n as usize);
     for g in groups.iter().filter(|g| g.Type == D3D12_BARRIER_TYPE_TEXTURE) {
@@ -3585,11 +3594,27 @@ pub(super) unsafe fn note_depth_uav_barrier_groups(n: u32, groups: *const c_void
         }
         for b in std::slice::from_raw_parts(t, k) {
             if barrier_uses_uav((b.LayoutBefore.0, b.LayoutAfter.0), (b.AccessBefore.0, b.AccessAfter.0)) {
-                if let Some(r) = b.pResource.as_ref() {
-                    note_depth_uav_barrier(r.as_raw() as usize, UavUse::Layout(b.LayoutBefore.0, b.LayoutAfter.0));
+                let Some(r) = b.pResource.as_ref() else { continue };
+                let res = r.as_raw() as usize;
+                if note_depth_uav_barrier(res, UavUse::Layout(b.LayoutBefore.0, b.LayoutAfter.0)) && super::depth_twin::enabled() {
+                    if let Some(into) = twin_copy((b.LayoutBefore.0, b.LayoutAfter.0)) {
+                        syncs.push((res, into));
+                    }
                 }
             }
         }
+    }
+    syncs
+}
+
+/// The copy between a depth buffer and its twin a texture barrier needs (layouts before, after):
+/// into UNORDERED_ACCESS: to the twin (true); out of it: back (false); None otherwise.
+fn twin_copy(layouts: (i32, i32)) -> Option<bool> {
+    let uav = D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS.0;
+    match (layouts.0 == uav, layouts.1 == uav) {
+        (false, true) => Some(true),
+        (true, false) => Some(false),
+        _ => None,
     }
 }
 

@@ -55,8 +55,9 @@ static WRAPPER_OF: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 
 struct Vtable(usize);
 
-/// The console list vtable: QueryInterface / AddRef / Release / Close / Reset of their own,
-/// every other slot a thunk to the currently active PC list's entry (`F_BACKING`).
+/// The console list vtable: QueryInterface / AddRef / Release / Close / Reset (including newer
+/// layout #139 Reset) of their own, every other slot a thunk to the currently active PC list's
+/// entry (`F_BACKING`).
 fn vtable() -> usize {
     static V: OnceLock<Vtable> = OnceLock::new();
     V.get_or_init(|| {
@@ -70,6 +71,7 @@ fn vtable() -> usize {
         v[2] = release as usize;
         v[9] = close as usize;
         v[10] = reset as usize;
+        v[139] = reset_newer as usize;
         Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
     })
     .0
@@ -182,6 +184,23 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
         *((this as usize + F_RING_AT) as *mut usize) = 0;
     }
     hr
+}
+
+/// #139 on the newer console layout (`real::QUEUE_SHIFTED`): `Reset(allocator, initial_pso, flags)`.
+/// Must go through `reset` so `F_PRIMARY` is reset and any mid-list split segments move to `spares`;
+/// forwarding #139 to `F_BACKING` resets only the last split segment while leaving stale earlier
+/// segments (on previously reset allocators) in `extra_active` for future `ExecuteCommandLists`.
+unsafe extern "system" fn reset_newer(this: *mut c_void, a1: usize, a2: usize, a3: usize) -> HRESULT {
+    reset_slot_139(this, a1, a2, a3, super::real::QUEUE_SHIFTED.load(std::sync::atomic::Ordering::Acquire))
+}
+
+unsafe fn reset_slot_139(this: *mut c_void, a1: usize, a2: usize, a3: usize, shifted: bool) -> HRESULT {
+    if shifted {
+        return reset(this, a1, a2);
+    }
+    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    let f: unsafe extern "system" fn(*mut c_void, usize, usize, usize) -> HRESULT = std::mem::transmute(pc_slot(pc, 139));
+    f(pc, a1, a2, a3)
 }
 
 /// The console object for the PC list `pc` (adopted; one reference moves to it).
@@ -439,6 +458,78 @@ mod tests {
             assert_eq!(r(o), 1);
             assert_eq!(r(o), 0); // the object is freed with it
             drop(Box::from_raw(fake));
+        }
+    }
+
+    #[test]
+    fn newer_layout_reset_slot_139_reclaims_split_segments() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static RESET10_THIS: AtomicUsize = AtomicUsize::new(0);
+        static RESET10_ALLOC: AtomicUsize = AtomicUsize::new(0);
+        static RESET10_PSO: AtomicUsize = AtomicUsize::new(0);
+        static OLDER139_THIS: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "system" fn fake_reset(this: *mut c_void, alloc: usize, pso: usize) -> HRESULT {
+            RESET10_THIS.store(this as usize, Ordering::SeqCst);
+            RESET10_ALLOC.store(alloc, Ordering::SeqCst);
+            RESET10_PSO.store(pso, Ordering::SeqCst);
+            0
+        }
+        unsafe extern "system" fn fake_slot_139(this: *mut c_void, _a1: usize, _a2: usize, _a3: usize) -> HRESULT {
+            OLDER139_THIS.store(this as usize, Ordering::SeqCst);
+            0x1234
+        }
+
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[0] = fake_qi as usize;
+        vt[1] = fake_add_ref as usize;
+        vt[2] = fake_release as usize;
+        vt[10] = fake_reset as usize;
+        vt[139] = fake_slot_139 as usize;
+
+        let primary = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let seg1 = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        unsafe {
+            let o = wrap(primary as *mut c_void);
+            assert_eq!(*(*(o as *const *const usize)).add(139), reset_newer as usize);
+
+            // Simulate a mid-list split activating `seg1` as F_BACKING.
+            activate_segment(o, primary as *mut c_void, seg1 as *mut c_void);
+            assert_eq!(wrapper_of(primary as *mut c_void), None);
+            assert_eq!(wrapper_of(seg1 as *mut c_void), Some(o));
+            let mut segs = Vec::new();
+            assert!(push_segments(o, &mut segs));
+            assert_eq!(segs, vec![primary as *mut c_void, seg1 as *mut c_void]);
+
+            // Older layout: slot #139 forwards to active backing (`seg1`) without reclaiming segments.
+            RESET10_THIS.store(0, Ordering::SeqCst);
+            OLDER139_THIS.store(0, Ordering::SeqCst);
+            assert_eq!(reset_slot_139(o, 0xAAA, 0xBBB, 0, false), 0x1234);
+            assert_eq!(OLDER139_THIS.load(Ordering::SeqCst), seg1 as usize);
+            assert_eq!(RESET10_THIS.load(Ordering::SeqCst), 0);
+            segs.clear();
+            assert!(push_segments(o, &mut segs));
+            assert_eq!(segs.len(), 2);
+
+            // Newer layout: slot #139 resets `primary`, restores `F_BACKING`, and moves `seg1` to spares.
+            assert_eq!(reset_slot_139(o, 0xCCC, 0xDDD, 0, true), 0);
+            assert_eq!(RESET10_THIS.load(Ordering::SeqCst), primary as usize);
+            assert_eq!(RESET10_ALLOC.load(Ordering::SeqCst), 0xCCC);
+            assert_eq!(RESET10_PSO.load(Ordering::SeqCst), 0xDDD);
+            assert_eq!(*((o as usize + F_BACKING) as *const usize), primary as usize);
+            assert_eq!(wrapper_of(primary as *mut c_void), Some(o));
+            assert_eq!(wrapper_of(seg1 as *mut c_void), None);
+            segs.clear();
+            assert!(push_segments(o, &mut segs));
+            assert_eq!(segs, vec![primary as *mut c_void]);
+            assert_eq!(pop_spare(o), Some(seg1 as *mut c_void));
+
+            // Release frees `o` and releases `primary`; we popped `seg1` above so free it directly.
+            let r: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(o as *const *const usize)).add(2));
+            assert_eq!(r(o), 0);
+            drop(Box::from_raw(primary));
+            drop(Box::from_raw(seg1));
         }
     }
 }

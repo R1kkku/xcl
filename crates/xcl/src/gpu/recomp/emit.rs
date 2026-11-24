@@ -3054,7 +3054,7 @@ impl Em {
         Ok(())
     }
 
-    /// 64-bit VALU: integer compares / shifts / v_mad_u64_u32 and the basic f64 operations.
+    /// 64-bit VALU: integer compares / shifts / v_mad_u64_u32 and standard f64 operations.
     fn valu64(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let (outs, ins) = Self::ops(d);
         let m = Self::mods(d);
@@ -4251,7 +4251,7 @@ impl Em {
             }
             h.push_str("static uint xcl_w = 0u;\nstatic uint xcl_uma_base = 0u;\n");
             h.push_str(MEM_ACCESSORS_HERE);
-        } else {
+        } else if body.contains("xcl_loadx4(") || body.contains("ld_raw(") {
             h.push_str(LOADX4_ONE_WINDOW);
         }
         for (i, (_, cmp)) in self.static_used.iter().enumerate() {
@@ -4270,9 +4270,29 @@ impl Em {
                 let _ = writeln!(h, "static uint xcl_sh{v}_{l} = 0u; // v_writelane slot: v{v} lane {l}");
             }
         }
-        let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
-        let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
-        h.push_str(PRELUDE_MEM);
+        let uses_bvh = body.contains("bvh_intersect(");
+        let uses_ld_raw = body.contains("ld_raw(");
+        let uses_fmt = body.contains("fmt_") || body.contains("img_cls(");
+        let uses_st_bytes = body.contains("st_bytes(");
+        let uses_dst_sel = body.contains("dst_sel(");
+
+        if uses_ld_raw {
+            h.push_str(PRELUDE_LD_RAW);
+        }
+        if uses_fmt {
+            let infos: Vec<String> = (0..BUF_FORMATS.len()).map(|i| format!("0x{:08X}u", buf_format_info(i))).collect();
+            let _ = writeln!(h, "static const uint FMT_INFO[78] = {{ {} }};", infos.join(", "));
+            h.push_str(PRELUDE_FMT);
+        }
+        if uses_bvh {
+            h.push_str(PRELUDE_BVH);
+        }
+        if uses_st_bytes {
+            h.push_str(PRELUDE_ST_BYTES);
+        }
+        if uses_dst_sel {
+            h.push_str(PRELUDE_DST_SEL);
+        }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
         }
@@ -5114,14 +5134,17 @@ const LOADX4_ONE_WINDOW: &str = "uint4 xcl_loadx4(uint4 a) { return uint4(mem.Lo
 fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
+    let mut used: BTreeSet<&str> = BTreeSet::new();
     while let Some(i) = rest.find("mem.") {
         let before_ok = rest[..i].chars().next_back().is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
         let tail = &rest[i + 4..];
         let name_len = tail.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(tail.len());
         if before_ok && tail[name_len..].starts_with('(') {
+            let name = &tail[..name_len];
+            used.insert(name);
             out.push_str(&rest[..i]);
             out.push_str("xcl_m");
-            out.push_str(&tail[..name_len]);
+            out.push_str(name);
             rest = &tail[name_len..];
         } else {
             out.push_str(&rest[..i + 4]);
@@ -5129,14 +5152,15 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap), 1)
+    let has_loadx4 = out.contains("xcl_loadx4(");
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap, &used, has_loadx4), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits.
 /// Only explicit windows `0..windows` touch GPU buffers; any out-of-range `xcl_w` hits
 /// `default` (reads return 0, stores/atomics are dropped and zero their `out` parameter) so
 /// out-of-UMA pointers can never wrap onto live memory windows.
-fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
+fn mem_accessors(windows: u32, heap: Option<&str>, used: &BTreeSet<&str>, has_loadx4: bool) -> String {
     let mut sigs: Vec<(&str, String, &str, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a", "return 0u;"),
         ("uint2", "Load2".into(), "uint a", "a", "return uint2(0u, 0u);"),
@@ -5165,9 +5189,17 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         // one access: window k is descriptor MEM_HEAP_BASE + k; out-of-range xcl_w returns 0 /
         // drops stores & atomics identically to the switch path (#792) so out-of-UMA pointers
         // never wrap onto live memory windows.
-        let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
-        let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ if (xcl_w < {windows}u) {{ XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }} return uint4(0u, 0u, 0u, 0u); }}");
+        let any_used = has_loadx4 || sigs.iter().any(|(_, name, ..)| used.contains(name.as_str()));
+        if any_used {
+            let _ = writeln!(s, "#define XCL_MW {coherent}RWByteAddressBuffer m = ResourceDescriptorHeap[NonUniformResourceIndex({}u + xcl_w)]", super::MEM_HEAP_BASE);
+        }
+        if has_loadx4 {
+            let _ = writeln!(s, "uint4 xcl_loadx4(uint4 a) {{ if (xcl_w < {windows}u) {{ XCL_MW; return uint4(m.Load(a.x), m.Load(a.y), m.Load(a.z), m.Load(a.w)); }} return uint4(0u, 0u, 0u, 0u); }}");
+        }
         for (ret, name, params, args, def) in sigs {
+            if !used.contains(name.as_str()) {
+                continue;
+            }
             let r = if ret == "void" { "" } else { "return " };
             let fallback = def.trim_end_matches("break;").trim();
             if fallback.is_empty() {
@@ -5178,13 +5210,18 @@ fn mem_accessors(windows: u32, heap: Option<&str>) -> String {
         }
         return s;
     }
-    let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
-    let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
-    for k in 1..windows {
-        let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+    if has_loadx4 {
+        let _ = write!(s, "uint4 xcl_loadx4(uint4 a) {{ [branch] switch (xcl_w) {{ ");
+        let _ = write!(s, "case 0u: return uint4(mem.Load(a.x), mem.Load(a.y), mem.Load(a.z), mem.Load(a.w)); ");
+        for k in 1..windows {
+            let _ = write!(s, "case {k}u: return uint4(mem{k}.Load(a.x), mem{k}.Load(a.y), mem{k}.Load(a.z), mem{k}.Load(a.w)); ");
+        }
+        let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     }
-    let _ = writeln!(s, "default: return uint4(0u, 0u, 0u, 0u); }} }}");
     for (ret, name, params, args, def) in sigs {
+        if !used.contains(name.as_str()) {
+            continue;
+        }
         let _ = write!(s, "{ret} xcl_m{name}({params}) {{ [branch] switch (xcl_w) {{ ");
         if ret == "void" {
             let _ = write!(s, "case 0u: mem.{name}({args}); break; ");
@@ -5279,7 +5316,7 @@ void scr_st(uint a, uint v, uint n) {
 }
 "#;
 
-const PRELUDE_MEM: &str = r#"
+const PRELUDE_LD_RAW: &str = r#"
 uint4 ld_raw(uint a) {
     // one Load4 + one Load (with several memory windows each is a switch) and no branch
     uint b = a & ~3u; uint s = (a & 3u) * 8u;
@@ -5287,6 +5324,9 @@ uint4 ld_raw(uint a) {
     uint4 n = uint4(w.yzw, w4);
     return select((s == 0u).xxxx, w, (w >> s) | (n << ((32u - s) & 31u)));
 }
+"#;
+
+const PRELUDE_FMT: &str = r#"
 // format helpers: no loops, no branches (inlined at every buffer access; `?:` and `if`
 // on scalars become control flow in HLSL 2021, which DXC is slow to clean up)
 uint bits_at(uint4 r, uint off, uint w) {
@@ -5319,6 +5359,10 @@ uint fmt_comp(uint4 r, uint info, uint c) {
     uint res = select(ty == 0u, f_un, select(ty == 1u, f_sn, select(ty == 2u, asuint(fv), select(ty == 3u, asuint(fsv), select(ty == 4u, v, select(ty == 5u, (uint)sv, flt))))));
     return select(c >= n, select(c == 3u, select(isint, 1u, 0x3F800000u), 0u), res);
 }
+uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
+"#;
+
+const PRELUDE_BVH: &str = r#"
 // image_bvh(64)_intersect_ray: type = node & 7, at = low 32 bits of base + (node & ~7) * 8.
 // box32 (5) / box16 (4): 4 child ids + boxes → hit children (closest first when sorting),
 // misses 0xFFFFFFFF; triangle (0..3): (t numerator, denominator, i, j numerators), miss t = inf;
@@ -5370,7 +5414,9 @@ uint4 bvh_intersect(uint type, uint at, float tmax, float3 o, float3 d, float3 i
     }
     return uint4(0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
 }
-uint img_cls(uint fmt) { uint ty = select(fmt <= 77u, (FMT_INFO[min(fmt, 77u)] >> 3) & 7u, 6u); return select(ty == 4u, 1u, select(ty == 5u, 2u, 0u)); }
+"#;
+
+const PRELUDE_ST_BYTES: &str = r#"
 void put_bits(inout uint4 r, uint off, uint w, uint v) {
     uint m = w >= 32u ? 0xFFFFFFFFu : ((1u << w) - 1u); v &= m;
     uint i = off >> 5; uint s = off & 31u;
@@ -5405,6 +5451,9 @@ void st_bytes(uint a, uint4 r, uint n) {
     st_part(b, m << s, r.x << s);
     if (s != 0u && s + 8u * n > 32u) st_part(b + 4u, m >> (32u - s), r.x >> (32u - s));
 }
+"#;
+
+const PRELUDE_DST_SEL: &str = r#"
 uint dst_sel(uint4 c, uint sel, bool isint) { return select(sel == 0u, 0u, select(sel == 1u, select(isint, 1u, 0x3F800000u), c[(sel - 4u) & 3u])); }
 "#;
 

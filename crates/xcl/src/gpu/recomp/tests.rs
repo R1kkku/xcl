@@ -7653,3 +7653,36 @@ fn fspx_containers_translate_and_compile() {
     println!("FSPX: {ok} / {n} translated and compiled");
     assert_eq!(ok, n);
 }
+
+/// Verify that unreferenced memory accessors and prelude helpers (bvh_intersect, FMT_INFO, st_bytes)
+/// are pruned from the emitted HLSL, while referenced ones are retained and compile with DXC.
+#[test]
+fn unreferenced_helpers_and_accessors_are_pruned() {
+    let enc = |n: &'static str, e: &'static str, f: &[(&str, u64)]| encode(n, e, f, None).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let mut code = Vec::new();
+    code.extend(enc("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 4), ("SBASE", 0), ("OFFSET", 0)]));
+    code.extend(enc("S_ADD_U32", "ENC_SOP2", &[("SDST", 5), ("SSRC0", 4), ("SSRC1", 4)]));
+    code.extend(enc("S_ENDPGM", "ENC_SOPP", &[]));
+
+    // 1. Single window: neither bvh_intersect, FMT_INFO, st_bytes, nor xcl_loadx4 are emitted
+    let one = super::translate(&code, &Options { mem_windows: 1, ..Default::default() }).unwrap();
+    assert!(!one.hlsl.contains("bvh_intersect"), "single window should omit bvh_intersect");
+    assert!(!one.hlsl.contains("FMT_INFO"), "single window should omit FMT_INFO");
+    assert!(!one.hlsl.contains("st_bytes"), "single window should omit st_bytes");
+    assert!(!one.hlsl.contains("xcl_loadx4"), "single window without ld_raw should omit xcl_loadx4");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&one.hlsl, "main", "cs_6_6", &[]).unwrap();
+    }
+
+    // 2. Multiple windows: only referenced accessors (xcl_mLoad) are emitted; unused (xcl_mStore, etc.) are omitted
+    let multi = super::translate(&code, &Options { mem_windows: 2, ..Default::default() }).unwrap();
+    assert!(!multi.hlsl.contains("bvh_intersect"), "multi window should omit bvh_intersect");
+    assert!(!multi.hlsl.contains("FMT_INFO"), "multi window should omit FMT_INFO");
+    assert!(!multi.hlsl.contains("st_bytes"), "multi window should omit st_bytes");
+    assert!(!multi.hlsl.contains("xcl_mStore"), "unused xcl_mStore should be omitted");
+    assert!(!multi.hlsl.contains("xcl_mInterlocked"), "unused atomics should be omitted");
+    assert!(multi.hlsl.contains("xcl_mLoad("), "used xcl_mLoad should be present");
+    if super::dxc::location().is_ok() {
+        super::dxc::compile(&multi.hlsl, "main", "cs_6_6", &[]).unwrap();
+    }
+}

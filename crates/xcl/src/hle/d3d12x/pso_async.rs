@@ -25,6 +25,8 @@ struct Pending {
     key: u64,
     /// it was used (`used::note` is told once)
     used: std::sync::atomic::AtomicBool,
+    /// a bounded graphics wait already timed out; subsequent draws skip waiting until `real` lands
+    timed_out: std::sync::atomic::AtomicBool,
     /// the stand-in was released before the real pipeline was built
     orphan: std::sync::atomic::AtomicBool,
 }
@@ -133,6 +135,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         compute,
         key,
         used: Default::default(),
+        timed_out: Default::default(),
         orphan: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
@@ -358,6 +361,135 @@ pub fn resolve_wait(pso: usize) -> usize {
     }
 }
 
+/// Maximum per-frame time title threads wait for uncached graphics pipelines at draw /
+/// `ExecuteIndirect` (`XCL_GRAPHICS_PSO_WAIT_MS`, default 500 ms; `0` = unbounded). A loading
+/// frame can issue dozens of uncached graphics draws in a row; sharing one budget per frame keeps
+/// render threads from stalling watchdogs while workers compile them in parallel.
+fn graphics_wait_timeout() -> Option<std::time::Duration> {
+    static LIMIT: OnceLock<Option<std::time::Duration>> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let ms = std::env::var("XCL_GRAPHICS_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(500);
+        if ms == 0 { None } else { Some(std::time::Duration::from_millis(ms)) }
+    })
+}
+
+/// Shared per-frame graphics pipeline wait budget, reset at each `PresentX` boundary.
+struct FrameBudget {
+    spent_ms: std::sync::atomic::AtomicU64,
+}
+
+impl FrameBudget {
+    const fn new() -> Self {
+        Self { spent_ms: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn remaining(&self, limit: std::time::Duration) -> std::time::Duration {
+        let limit_ms = limit.as_millis().min(u64::MAX as u128) as u64;
+        let spent = self.spent_ms.load(Ordering::Relaxed);
+        std::time::Duration::from_millis(limit_ms.saturating_sub(spent))
+    }
+
+    fn consume(&self, elapsed: std::time::Duration) {
+        let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        if ms > 0 {
+            self.spent_ms.fetch_add(ms, Ordering::Relaxed);
+        }
+    }
+
+    fn reset(&self) {
+        self.spent_ms.store(0, Ordering::Relaxed);
+    }
+}
+
+static GRAPHICS_FRAME_BUDGET: FrameBudget = FrameBudget::new();
+
+/// Reset the per-frame graphics pipeline wait budget (called at `PresentX`).
+pub fn reset_frame_budget() {
+    GRAPHICS_FRAME_BUDGET.reset();
+}
+
+fn enqueue(p: &Arc<Pending>) -> bool {
+    if !p.sent.swap(true, Ordering::AcqRel) && queue().lock().unwrap().send(p.clone()).is_err() {
+        p.sent.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+fn resolve_graphics_within(pso: usize, limit: Option<std::time::Duration>, budget: &FrameBudget) -> usize {
+    let Some(limit) = limit else {
+        return resolve_wait(pso);
+    };
+    let Some(p) = entry(pso) else { return pso };
+    p.note_use();
+    if let r @ 1.. = p.real.load(Ordering::Acquire) {
+        return r;
+    }
+    if !enqueue(&p) {
+        return pso;
+    }
+    if p.timed_out.load(Ordering::Acquire) {
+        return match p.real.load(Ordering::Acquire) {
+            0 => pso,
+            r => r,
+        };
+    }
+    let rem_budget = budget.remaining(limit);
+    if rem_budget.is_zero() {
+        return match p.real.load(Ordering::Acquire) {
+            0 => pso,
+            r => r,
+        };
+    }
+    let started = std::time::Instant::now();
+    let deadline = started + rem_budget;
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        let rem = deadline.saturating_duration_since(std::time::Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let (g, res) = p.cv.wait_timeout(done, rem).unwrap();
+        done = g;
+        if res.timed_out() {
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    if !*done {
+        budget.consume(elapsed.max(rem_budget));
+        if rem_budget >= limit / 2 && !p.timed_out.swap(true, Ordering::AcqRel) {
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 16 {
+                crate::xlog_warn!(
+                    "D3D12.X: graphics pipeline {pso:#x} still building after {} ms – proceeding with stand-in (continues in background)",
+                    elapsed.as_millis()
+                );
+            }
+        }
+        return pso;
+    }
+    budget.consume(elapsed);
+    match p.real.load(Ordering::Acquire) {
+        0 => pso,
+        r => r,
+    }
+}
+
+/// Resolve a graphics pipeline with `XCL_GRAPHICS_PSO_WAIT_MS` per-frame bounding.
+pub fn resolve_graphics(pso: usize) -> usize {
+    resolve_graphics_within(pso, graphics_wait_timeout(), &GRAPHICS_FRAME_BUDGET)
+}
+
+/// For `ExecuteIndirect`: graphics pipelines use bounded per-frame waits; compute keeps `resolve_wait`.
+pub fn resolve_for_indirect(pso: usize) -> usize {
+    match entry(pso) {
+        Some(p) if p.compute => resolve_wait(pso),
+        Some(_) => resolve_graphics(pso),
+        None => pso,
+    }
+}
+
 /// For binding: compute pipelines are waited for, graphics ones are not.
 pub fn resolve_for_bind(pso: usize) -> usize {
     match entry(pso) {
@@ -391,4 +523,61 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod graphics_budget_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_graphics_wait_shares_budget_and_resolves_after_worker_finishes() {
+        let standin_a = 0x7300_0009usize;
+        let real_a = 0x7300_000ausize;
+        let standin_b = 0x7300_000busize;
+        let real_b = 0x7300_000cusize;
+        let budget = FrameBudget::new();
+        let (tx_a, rx_a) = mpsc::channel::<()>();
+        let (tx_b, rx_b) = mpsc::channel::<()>();
+        submit_lazy(
+            standin_a,
+            false,
+            Box::new(move || {
+                let _ = rx_a.recv_timeout(Duration::from_secs(5));
+                real_a
+            }),
+            0,
+        );
+        submit_lazy(
+            standin_b,
+            false,
+            Box::new(move || {
+                let _ = rx_b.recv_timeout(Duration::from_secs(5));
+                real_b
+            }),
+            0,
+        );
+
+        // First slow graphics pipeline consumes the 60 ms frame budget on background workers.
+        assert_eq!(resolve_graphics_within(standin_a, Some(Duration::from_millis(60)), &budget), standin_a);
+        assert!(is_pending(standin_a));
+
+        // Second uncached graphics pipeline in the same exhausted frame returns immediately.
+        let t_b = Instant::now();
+        assert_eq!(resolve_graphics_within(standin_b, Some(Duration::from_millis(60)), &budget), standin_b);
+        assert!(t_b.elapsed() < Duration::from_millis(20), "second graphics pipeline must not multiply wait time");
+
+        // Once workers finish and the frame budget resets, both resolve to their real PSOs.
+        budget.reset();
+        tx_a.send(()).unwrap();
+        tx_b.send(()).unwrap();
+        assert_eq!(resolve_graphics_within(standin_b, Some(Duration::from_secs(4)), &budget), real_b);
+        let wait = Instant::now();
+        while resolve_graphics_within(standin_a, Some(Duration::from_millis(50)), &budget) != real_a {
+            assert!(wait.elapsed() < Duration::from_secs(5), "background graphics PSO A never completed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(released(standin_a), real_a);
+        assert_eq!(released(standin_b), real_b);
+    }
 }

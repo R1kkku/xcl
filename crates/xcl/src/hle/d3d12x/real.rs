@@ -1558,7 +1558,23 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
     let pins = super::sparse::buffer_pins(this as usize);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    // The last reference: kept until the queues are past the work in flight (`late_release`).
+    // (Two last-but-one releases at once can miss each other here; the object then goes at
+    // once, as before.)
+    let mut held = false;
+    let n = if super::late_release::enabled() {
+        let add: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 1));
+        if add(this) == 2 {
+            f(this);
+            held = true;
+            0
+        } else {
+            f(this);
+            f(this)
+        }
+    } else {
+        f(this)
+    };
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1585,6 +1601,9 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
                 u.free(p);
             }
         }
+    }
+    if held {
+        super::late_release::hold(this as usize);
     }
     n
 }
@@ -5291,15 +5310,25 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::alloc_pool::forget(this as usize);
         super::list_x::on_allocator_release(this as usize);
     }
     n
 }
 
-unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+/// Reset the (adopted) PC allocator `raw` itself.
+pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
     type F = unsafe extern "system" fn(*mut c_void) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
-    let hr = f(this);
+    let f: F = std::mem::transmute(orig_fn(raw, slot_of(raw, "Reset")));
+    f(raw)
+}
+
+unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
+    // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
+    let hr = match super::alloc_pool::title_reset(this) {
+        Some(hr) => hr,
+        None => reset_pc_allocator(this),
+    };
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
@@ -5532,6 +5561,7 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
     super::list_x::note_queue_for_lists(this as usize, &mapped);
     super::list_x::execute_with_waits_on(this, &mapped, |chunk| {
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::alloc_pool::executed(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);

@@ -34,6 +34,7 @@ struct Job {
     fence: ID3D12Fence,
     value: u64,
     writes: Vec<Write>,
+    done: Option<mpsc::Sender<()>>,
 }
 
 // SAFETY: the fence is a free-threaded COM object; the writes are plain data
@@ -48,6 +49,16 @@ struct QueueFence {
 unsafe impl Send for QueueFence {}
 
 static FENCES: Mutex<Option<HashMap<usize, QueueFence>>> = Mutex::new(None);
+
+/// Forget a retired queue's cached fence before its address can be reused. Submitted jobs own
+/// fence clones, so extracting this entry cannot let their writes run early.
+pub(super) fn forget_queue(id: super::present::QueueId) {
+    let gone = {
+        let mut fences = FENCES.lock().unwrap();
+        fences.as_mut().and_then(|fences| fences.remove(&id.raw()))
+    };
+    drop(gone);
+}
 
 /// how long the worker waits for one submission before writing anyway (a removed device, a
 /// queue that never gets there)
@@ -79,6 +90,9 @@ fn worker() -> &'static Mutex<mpsc::Sender<Job>> {
                         }
                     }
                 }
+                if let Some(done) = job.done {
+                    let _ = done.send(());
+                }
             }
         });
         if let Err(e) = spawned {
@@ -106,20 +120,39 @@ unsafe fn write_now(va: usize, words: &[u32]) {
     }
 }
 
+/// Whether `[va, va + 8)` is 8-byte aligned, committed, and writable without `PAGE_GUARD`.
+unsafe fn u64_writable_now(va: usize) -> bool {
+    if va == 0 || !va.is_multiple_of(8) {
+        return false;
+    }
+    let Some(end) = va.checked_add(8) else { return false };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, 8)) {
+        return true;
+    }
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
+    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
+        return false;
+    }
+    m.Protect & PAGE_GUARD == 0
+        && m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) != 0
+        && (m.BaseAddress as usize).saturating_add(m.RegionSize) >= end
+}
+
 /// An 8-byte aligned 64-bit value at `va`, if the memory is still there and writable.
 unsafe fn write_u64_now(va: usize, value: u64) {
-    let Some(end) = va.checked_add(8) else { return };
-    if !crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, 8)) {
-        use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE};
-        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(va as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT {
-            return;
-        }
-        if m.Protect & PAGE_GUARD != 0 || m.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE) == 0 || (m.BaseAddress as usize).saturating_add(m.RegionSize) < end {
-            return;
-        }
+    if u64_writable_now(va) {
+        (*(va as *const AtomicU64)).store(value, Ordering::Release);
     }
-    (*(va as *const AtomicU64)).store(value, Ordering::Release);
+}
+
+/// Advance an 8-byte aligned 64-bit value at `va` to at least `value` (`fetch_max`), if the memory
+/// is still committed and writable. Best-effort check before the atomic write (same TOCTOU
+/// trade-off as `write_u64_now`: a concurrent title decommit between check and store is unguarded).
+pub(super) unsafe fn max_u64_now(va: usize, value: u64) {
+    if u64_writable_now(va) {
+        (*(va as *const AtomicU64)).fetch_max(value, Ordering::AcqRel);
+    }
 }
 
 /// Whether `[va, va + bytes)` is memory the CPU can write for the GPU later.
@@ -137,12 +170,34 @@ pub(super) fn writable(va: usize, bytes: usize) -> bool {
         && m.BaseAddress as usize + m.RegionSize >= va + bytes
 }
 
-/// `writes` of lists just submitted to `queue`: done when the GPU has finished them.
-pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
-    if writes.is_empty() || queue.is_null() {
-        return;
+/// Receipt published only after the worker has applied every deferred store in a submission.
+pub(super) struct Completion(mpsc::Receiver<()>);
+
+impl Completion {
+    pub(super) fn wait(self) -> bool {
+        let _stall = crate::stall::span(crate::stall::StallKind::MemorySynchronization);
+        self.0.recv().is_ok()
     }
-    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+}
+
+#[cfg(test)]
+pub(super) fn completion_pair_for_test() -> (Completion, mpsc::Sender<()>) {
+    let (tx, rx) = mpsc::channel();
+    (Completion(rx), tx)
+}
+
+/// Schedule `writes` from lists just submitted to `queue` after the GPU has finished them.
+unsafe fn schedule(queue: *mut c_void, writes: Vec<Write>, completion: bool) -> Option<Completion> {
+    if writes.is_empty() || queue.is_null() {
+        return None;
+    }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return None };
+    let (done, receipt) = if completion {
+        let (tx, rx) = mpsc::channel();
+        (Some(tx), Some(Completion(rx)))
+    } else {
+        (None, None)
+    };
     let job = {
         let mut g = FENCES.lock().unwrap();
         let m = g.get_or_insert_with(HashMap::new);
@@ -151,22 +206,31 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 let mut dev: Option<ID3D12Device> = None;
                 if q.GetDevice(&mut dev).is_err() {
-                    return;
+                    return None;
                 }
-                let Some(dev) = dev else { return };
-                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return };
+                let Some(dev) = dev else { return None };
+                let Ok(fence) = dev.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) else { return None };
                 v.insert(QueueFence { fence, value: 0 })
             }
         };
         entry.value += 1;
-        if q.Signal(&entry.fence, entry.value).is_err() {
-            return;
+        if super::real::native_queue_signal(q, &entry.fence, entry.value).is_err() {
+            return None;
         }
-        Job { fence: entry.fence.clone(), value: entry.value, writes }
+        Job { fence: entry.fence.clone(), value: entry.value, writes, done }
     };
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| crate::xlog_info!("D3D12.X: bottom-of-pipe writes outside unified memory are done by the CPU after the GPU ({} in the first submission)", job.writes.len()));
-    let _ = worker().lock().unwrap().send(job);
+    worker().lock().unwrap().send(job).ok()?;
+    receipt
+}
+
+pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
+    let _ = schedule(queue, writes, false);
+}
+
+pub(super) unsafe fn after_with_completion(queue: *mut c_void, writes: Vec<Write>) -> Option<Completion> {
+    schedule(queue, writes, true)
 }
 
 #[cfg(test)]
@@ -190,12 +254,8 @@ mod tests {
             let cell = Box::new([0u32; 2]);
             let va = cell.as_ptr() as usize;
             assert!(writable(va, 8));
-            after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
-            let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
-                assert!(t.elapsed().as_secs() < 5, "never written");
-                std::thread::yield_now();
-            }
+            let completion = after_with_completion(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]).expect("scheduled CPU write");
+            assert!(completion.wait());
             assert_eq!(*cell, [7, 9]);
         }
     }
